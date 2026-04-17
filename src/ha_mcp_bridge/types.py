@@ -57,3 +57,13 @@ class HistoryPoint(BaseModel):
             last_changed=raw.get("last_changed"),
             unit_of_measurement=attrs.get("unit_of_measurement"),
         )
+
+
+class BinnedPoint(BaseModel):
+    bucket_start: str
+    n: int
+    mean: float | None = None
+    min: float | None = None
+    max: float | None = None
+    first: float | None = None
+    last: float | None = None
