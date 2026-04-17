@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
 import os
@@ -39,13 +40,32 @@ INFLUX_TIMEOUT = float(os.environ.get("INFLUX_HTTP_TIMEOUT", "30"))
 # enough. Guard at the tool layer so we return an actionable error instead of stalling.
 MAX_RESPONSE_BYTES = int(os.environ.get("HA_MCP_MAX_RESPONSE_BYTES", "120000"))
 
-# Opt-in debug log to a file (NEVER stdout — that's the MCP transport).
+
+def _parse_csv_env(name: str) -> list[str]:
+    raw = os.environ.get(name, "")
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
+# Allowlist for ha_call_service. Both lists must be non-empty for the tool to operate
+# (default-deny). Patterns use fnmatch glob syntax — e.g. "light.*" matches all light
+# services; "*plant_shelf*" matches any entity with that substring.
+ALLOWED_SERVICES = _parse_csv_env("HA_MCP_ALLOWED_SERVICES")
+ALLOWED_ENTITY_PATTERNS = _parse_csv_env("HA_MCP_ALLOWED_ENTITY_PATTERNS")
+
+# Logging: warnings go to stderr by default (security denials need to be visible).
+# Setting HA_MCP_DEBUG_LOG routes full debug output to that file.
 _DEBUG_LOG = os.environ.get("HA_MCP_DEBUG_LOG", "")
 if _DEBUG_LOG:
     logging.basicConfig(
         filename=_DEBUG_LOG,
         level=logging.DEBUG,
         format="%(asctime)s %(levelname)s %(message)s",
+    )
+else:
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=logging.WARNING,
+        format="%(asctime)s %(levelname)s ha-mcp-bridge: %(message)s",
     )
 log = logging.getLogger("ha-mcp-bridge")
 
@@ -93,6 +113,14 @@ def _guard_list(tool: str, data: list[dict[str, Any]], hint: str) -> list[dict[s
     if size > MAX_RESPONSE_BYTES:
         return [_size_error(tool, size, hint)]
     return data
+
+
+def _is_service_allowed(service_id: str) -> bool:
+    return any(fnmatch.fnmatchcase(service_id, p) for p in ALLOWED_SERVICES)
+
+
+def _is_entity_allowed(entity_id: str) -> bool:
+    return any(fnmatch.fnmatchcase(entity_id, p) for p in ALLOWED_ENTITY_PATTERNS)
 
 
 @mcp.tool()
@@ -318,6 +346,88 @@ async def ha_press_button(entity_id: str) -> dict:
             return {"error": str(e)}
 
     return {"ok": True, "entity_id": entity_id, "result": result}
+
+
+@mcp.tool()
+async def ha_call_service(domain: str, service: str, data: dict | None = None) -> dict:
+    """Call an allowlisted Home Assistant service. Default-deny — both env allowlists
+    must be set for this tool to operate.
+
+    Configured via two env vars (fnmatch glob patterns, comma-separated):
+      HA_MCP_ALLOWED_SERVICES          e.g. "light.*,switch.turn_on,switch.turn_off,scene.turn_on"
+      HA_MCP_ALLOWED_ENTITY_PATTERNS   e.g. "*plant_shelf*,light.grow_*"  (or "*" to allow any)
+
+    Both gates are evaluated: the service id `{domain}.{service}` must match at least one
+    service pattern, AND every entity_id in `data` must match at least one entity pattern.
+    Area/device-level targeting is not permitted — call with explicit entity_id(s).
+
+    Denials are logged to stderr so the operator can audit attempted out-of-scope calls.
+
+    Args:
+        domain: Service domain, e.g. "light", "switch", "scene", "fan".
+        service: Service name, e.g. "turn_on", "toggle", "set_percentage".
+        data: Service payload. MUST contain "entity_id" (string or list of strings).
+            Additional keys are passed through (e.g. brightness_pct, rgb_color, percentage).
+
+    Returns:
+        {ok: true, service, entity_ids, result} on success.
+        {error: "ha_call_service disabled" | "service_not_allowed" | "entity_not_allowed"
+         | "entity_required" | <HA error>, ...diagnostic fields} on failure.
+    """
+    if not ALLOWED_SERVICES or not ALLOWED_ENTITY_PATTERNS:
+        return {
+            "error": "ha_call_service disabled",
+            "hint": (
+                "Set both HA_MCP_ALLOWED_SERVICES and HA_MCP_ALLOWED_ENTITY_PATTERNS "
+                "in env to enable. Both accept comma-separated fnmatch glob patterns."
+            ),
+            "allowed_services_set": bool(ALLOWED_SERVICES),
+            "allowed_entity_patterns_set": bool(ALLOWED_ENTITY_PATTERNS),
+        }
+
+    service_id = f"{domain}.{service}"
+    if not _is_service_allowed(service_id):
+        log.warning("ha_call_service DENIED service: %s", service_id)
+        return {
+            "error": "service_not_allowed",
+            "service": service_id,
+            "allowed_services": ALLOWED_SERVICES,
+        }
+
+    payload = dict(data or {})
+    raw_entity = payload.get("entity_id")
+    if raw_entity is None:
+        if "area_id" in payload or "device_id" in payload:
+            return {
+                "error": "entity_required",
+                "hint": "Area/device-level targeting is not permitted. Call with explicit entity_id.",
+            }
+        return {
+            "error": "entity_required",
+            "hint": "data must include entity_id (string or list of strings).",
+        }
+
+    entity_ids = [raw_entity] if isinstance(raw_entity, str) else list(raw_entity)
+    for eid in entity_ids:
+        if not _is_entity_allowed(eid):
+            log.warning(
+                "ha_call_service DENIED entity: %s (service %s)", eid, service_id
+            )
+            return {
+                "error": "entity_not_allowed",
+                "entity_id": eid,
+                "service": service_id,
+                "allowed_entity_patterns": ALLOWED_ENTITY_PATTERNS,
+            }
+
+    async with _client() as ha:
+        try:
+            result = await ha.call_service(domain, service, payload)
+        except HAError as e:
+            return {"error": str(e), "service": service_id, "entity_ids": entity_ids}
+
+    log.info("ha_call_service OK: %s on %s", service_id, entity_ids)
+    return {"ok": True, "service": service_id, "entity_ids": entity_ids, "result": result}
 
 
 @mcp.tool()
