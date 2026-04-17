@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
+import sys
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -30,11 +34,24 @@ INFLUX_TOKEN = os.environ.get("INFLUX_TOKEN", "")
 INFLUX_ORG = os.environ.get("INFLUX_ORG", "homelab")
 INFLUX_TIMEOUT = float(os.environ.get("INFLUX_HTTP_TIMEOUT", "30"))
 
+# Responses larger than this serialize to more than a single pipe buffer (64KB default
+# on Linux) and will hang the MCP stdio transport if the client isn't draining fast
+# enough. Guard at the tool layer so we return an actionable error instead of stalling.
+MAX_RESPONSE_BYTES = int(os.environ.get("HA_MCP_MAX_RESPONSE_BYTES", "120000"))
+
+# Opt-in debug log to a file (NEVER stdout — that's the MCP transport).
+_DEBUG_LOG = os.environ.get("HA_MCP_DEBUG_LOG", "")
+if _DEBUG_LOG:
+    logging.basicConfig(
+        filename=_DEBUG_LOG,
+        level=logging.DEBUG,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+log = logging.getLogger("ha-mcp-bridge")
+
 if not HA_TOKEN:
     # Don't crash at import — MCP handshake may still work, but tool calls will fail loud.
     # This lets `ha-mcp-bridge --help` style probes work without a token present.
-    import sys
-
     print(
         "WARN: HA_TOKEN not set. Tool calls will fail until it is populated.",
         file=sys.stderr,
@@ -50,6 +67,32 @@ def _client() -> HAClient:
 
 def _influx() -> InfluxClient:
     return InfluxClient(INFLUX_URL, INFLUX_TOKEN, INFLUX_ORG, timeout=INFLUX_TIMEOUT)
+
+
+def _size_error(tool: str, size_bytes: int, hint: str) -> dict[str, Any]:
+    """Build the standard oversize-response error payload."""
+    log.warning("size guard: %s produced %d bytes (limit %d)", tool, size_bytes, MAX_RESPONSE_BYTES)
+    return {
+        "error": "response_too_large",
+        "tool": tool,
+        "size_bytes": size_bytes,
+        "limit_bytes": MAX_RESPONSE_BYTES,
+        "hint": hint,
+    }
+
+
+def _guard_dict(tool: str, data: dict[str, Any], hint: str) -> dict[str, Any]:
+    size = len(json.dumps(data, default=str))
+    if size > MAX_RESPONSE_BYTES:
+        return _size_error(tool, size, hint)
+    return data
+
+
+def _guard_list(tool: str, data: list[dict[str, Any]], hint: str) -> list[dict[str, Any]]:
+    size = len(json.dumps(data, default=str))
+    if size > MAX_RESPONSE_BYTES:
+        return [_size_error(tool, size, hint)]
+    return data
 
 
 @mcp.tool()
@@ -74,7 +117,13 @@ async def ha_list_entities(domain: str | None = None) -> list[dict]:
         prefix = f"{domain}."
         raw = [e for e in raw if e.get("entity_id", "").startswith(prefix)]
 
-    return [EntityInfo.from_ha(e).model_dump() for e in raw]
+    result = [EntityInfo.from_ha(e).model_dump() for e in raw]
+    hint = (
+        "Filter by domain (e.g. domain='sensor') to narrow the list. "
+        f"Unfiltered HA instances with many entities easily exceed the "
+        f"{MAX_RESPONSE_BYTES}-byte response cap."
+    )
+    return _guard_list("ha_list_entities", result, hint)
 
 
 @mcp.tool()
@@ -122,7 +171,12 @@ async def ha_history(entity_id: str, hours: int = 24) -> list[dict]:
         except HAError as e:
             return [{"error": str(e)}]
 
-    return [HistoryPoint.from_ha(p).model_dump() for p in raw]
+    result = [HistoryPoint.from_ha(p).model_dump() for p in raw]
+    hint = (
+        f"Shorten the window (hours=), or switch to ha_history_binned to bucket a "
+        f"flappy sensor. Current response exceeds {MAX_RESPONSE_BYTES} bytes."
+    )
+    return _guard_list("ha_history", result, hint)
 
 
 @mcp.tool()
@@ -152,7 +206,11 @@ async def ha_query_grouped(entity_ids: list[str], hours: int = 1) -> dict:
     async with _client() as ha:
         results = await asyncio.gather(*(one(ha, eid) for eid in entity_ids))
 
-    return dict(results)
+    hint = (
+        "Narrow the window (hours=), drop entities from entity_ids, or call "
+        "ha_history_binned per-entity with a larger bin_minutes to pre-aggregate."
+    )
+    return _guard_dict("ha_query_grouped", dict(results), hint)
 
 
 @mcp.tool()
@@ -228,7 +286,12 @@ async def ha_history_binned(
             point.last = samples[-1][1]
         out.append(point)
 
-    return [p.model_dump(exclude_none=True) for p in out]
+    result = [p.model_dump(exclude_none=True) for p in out]
+    hint = (
+        "Raise bin_minutes or shorten the window (hours=). A 24h window at "
+        "bin_minutes=1 can emit 1440 buckets."
+    )
+    return _guard_list("ha_history_binned", result, hint)
 
 
 @mcp.tool()
@@ -304,7 +367,11 @@ async def influx_flux(query: str) -> dict:
         except InfluxError as e:
             return {"error": str(e)}
 
-    return {"ok": True, "rows": rows, "n": len(rows)}
+    hint = (
+        "Add an aggregateWindow() step, narrow the range(), or filter tighter. "
+        "Large raw CSV responses hang the MCP stdio transport."
+    )
+    return _guard_dict("influx_flux", {"ok": True, "rows": rows, "n": len(rows)}, hint)
 
 
 @mcp.tool()
