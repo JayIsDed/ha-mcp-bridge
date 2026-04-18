@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "ha-mcp-bridge"
 version = "0.1.0"
-description = "Read-only MCP server bridging Home Assistant entity state + history to Claude."
+description = "MCP server bridging Home Assistant + InfluxDB to Claude. Observation-first, scoped actuation via allowlist."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -15,6 +15,7 @@ dependencies = [
     "aiohttp>=3.9",
     "pydantic>=2.5",
     "python-dotenv>=1.0",
+    "Pillow>=10.0",
 ]
 
 [project.optional-dependencies]

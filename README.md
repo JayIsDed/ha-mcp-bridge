@@ -8,9 +8,11 @@ Tools:
 **Observation**
 - `ha_list_entities(domain=None)` — list entities, optional domain filter.
 - `ha_state(entity_id)` — current state + attributes for one entity.
+- `ha_camera_snapshot(entity_id, max_width=1024, quality=70)` — latest camera frame as a viewable image (resized + recompressed).
 - `ha_history(entity_id, hours=24)` — state-change history over a window.
 - `ha_query_grouped(entity_ids, hours=1)` — bundled history for correlation queries.
 - `ha_history_binned(entity_id, hours=24, bin_minutes=15, aggregation="mean")` — bucketed aggregation.
+- `ha_logbook(hours=1, entity_id=None)` — human-readable event log ("what happened recently").
 - `ha_template(template)` — render a Jinja2 template against live HA state.
 - `influx_flux(query)` — raw Flux query against the homelab InfluxDB 2.x instance.
 
@@ -60,6 +62,8 @@ $EDITOR .env   # paste HA_TOKEN
 | `INFLUX_ORG` | for `influx_flux` | `homelab` | InfluxDB org |
 | `HA_MCP_MAX_RESPONSE_BYTES` | no | `120000` | Per-tool response cap (stdio pipe-overflow guard) |
 | `HA_MCP_DEBUG_LOG` | no | — | If set, bridge writes DEBUG logs to this file |
+| `HA_MCP_CAMERA_MAX_WIDTH` | no | `1024` | Default resize width (px) for `ha_camera_snapshot` |
+| `HA_MCP_CAMERA_JPEG_QUALITY` | no | `70` | Default JPEG quality for `ha_camera_snapshot` |
 | `HA_MCP_ALLOWED_SERVICES` | to enable `ha_call_service` | — | fnmatch globs on `domain.service` |
 | `HA_MCP_ALLOWED_ENTITY_PATTERNS` | to enable `ha_call_service` | — | fnmatch globs on `entity_id` |
 

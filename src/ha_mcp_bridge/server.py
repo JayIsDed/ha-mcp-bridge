@@ -5,11 +5,14 @@ import json
 import logging
 import os
 import sys
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.utilities.types import Image
+from PIL import Image as PILImage
 
 from .ha_client import HAClient, HAError
 from .influx_client import InfluxClient, InfluxError
@@ -39,6 +42,10 @@ INFLUX_TIMEOUT = float(os.environ.get("INFLUX_HTTP_TIMEOUT", "30"))
 # on Linux) and will hang the MCP stdio transport if the client isn't draining fast
 # enough. Guard at the tool layer so we return an actionable error instead of stalling.
 MAX_RESPONSE_BYTES = int(os.environ.get("HA_MCP_MAX_RESPONSE_BYTES", "120000"))
+
+# Camera snapshot defaults — resize + recompress so 4K frames don't hang stdio.
+CAMERA_MAX_WIDTH = int(os.environ.get("HA_MCP_CAMERA_MAX_WIDTH", "1024"))
+CAMERA_JPEG_QUALITY = int(os.environ.get("HA_MCP_CAMERA_JPEG_QUALITY", "70"))
 
 
 def _parse_csv_env(name: str) -> list[str]:
@@ -177,6 +184,70 @@ async def ha_state(entity_id: str) -> dict:
     if raw is None:
         return {"error": f"entity not found: {entity_id}"}
     return EntityState.from_ha(raw).model_dump()
+
+
+@mcp.tool()
+async def ha_camera_snapshot(
+    entity_id: str,
+    max_width: int | None = None,
+    quality: int | None = None,
+) -> Any:
+    """Fetch the latest frame from a Home Assistant camera entity as a viewable image.
+
+    Returned as an MCP image content block so Claude can see the frame directly
+    (plant growth check, leaf pose, algae bloom, tank clarity, grow-light coverage).
+    The raw frame is resized + JPEG-recompressed before return to stay under the
+    stdio pipe buffer — unresized 4K snapshots would hang the transport.
+
+    Args:
+        entity_id: Fully-qualified camera entity, e.g. "camera.reolink_e1_zoom".
+            Must start with "camera." — any other domain is refused.
+        max_width: Resize so the longest edge <= this many px. Default from env
+            (HA_MCP_CAMERA_MAX_WIDTH=1024). Aspect ratio preserved.
+        quality: JPEG quality 1-95. Default from env (HA_MCP_CAMERA_JPEG_QUALITY=70).
+            70 is visually indistinguishable from 90 at 1024px for most scenes.
+
+    Returns:
+        Image content (mime image/jpeg) on success — Claude can view it directly.
+        {error: ...} dict on failure: wrong entity domain, unreachable camera,
+        or post-resize image still exceeds the response size cap.
+    """
+    if not entity_id.startswith("camera."):
+        return {
+            "error": "invalid_entity_domain",
+            "hint": f"ha_camera_snapshot only operates on camera.* entities, got: {entity_id}",
+        }
+
+    max_w = int(max_width) if max_width is not None else CAMERA_MAX_WIDTH
+    q = max(1, min(95, int(quality) if quality is not None else CAMERA_JPEG_QUALITY))
+
+    async with _client() as ha:
+        try:
+            raw = await ha.get_camera_snapshot(entity_id)
+        except HAError as e:
+            return {"error": str(e), "entity_id": entity_id}
+
+    try:
+        img = PILImage.open(BytesIO(raw))
+        if img.width > max_w:
+            ratio = max_w / img.width
+            img = img.resize((max_w, int(img.height * ratio)), PILImage.LANCZOS)
+        buf = BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=q, optimize=True)
+        processed = buf.getvalue()
+    except Exception as e:
+        return {"error": f"image_processing_failed: {e}", "entity_id": entity_id}
+
+    if len(processed) > MAX_RESPONSE_BYTES:
+        return {
+            "error": "image_too_large",
+            "entity_id": entity_id,
+            "size_bytes": len(processed),
+            "limit_bytes": MAX_RESPONSE_BYTES,
+            "hint": "Lower max_width or quality parameters.",
+        }
+
+    return Image(data=processed, format="jpeg")
 
 
 @mcp.tool()
@@ -320,6 +391,38 @@ async def ha_history_binned(
         "bin_minutes=1 can emit 1440 buckets."
     )
     return _guard_list("ha_history_binned", result, hint)
+
+
+@mcp.tool()
+async def ha_logbook(hours: int = 1, entity_id: str | None = None) -> list[dict]:
+    """Fetch HA's human-readable event log over a time window.
+
+    Logbook captures state changes HA considers noteworthy: automations firing,
+    devices turning on/off, user actions, scripts running. Cleaner than raw
+    history for "what happened around time X" questions.
+
+    Args:
+        hours: Window length in hours, 1..168 (clamped). Default 1h.
+        entity_id: Optional — filter to a single entity's events. Omit for all.
+
+    Returns:
+        Time-ordered list of {when, name, message?, state?, entity_id?, domain?}.
+        `message` is the human phrase (e.g. "turned on", "executed automation");
+        numeric sensors typically don't appear unless explicitly logbook-tracked.
+        Returns [{error: ...}] on failure or [] if nothing happened in the window.
+    """
+    hours = max(1, min(HA_HISTORY_MAX_HOURS, int(hours)))
+    async with _client() as ha:
+        try:
+            raw = await ha.get_logbook(hours, entity_id)
+        except HAError as e:
+            return [{"error": str(e)}]
+
+    hint = (
+        "Shorten the window (hours=) or filter to a specific entity_id. "
+        "Busy automations can produce hundreds of entries."
+    )
+    return _guard_list("ha_logbook", raw, hint)
 
 
 @mcp.tool()
