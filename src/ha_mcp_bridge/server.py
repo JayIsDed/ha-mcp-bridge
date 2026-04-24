@@ -16,7 +16,7 @@ from PIL import Image as PILImage
 
 from .ha_client import HAClient, HAError
 from .influx_client import InfluxClient, InfluxError
-from .shelf_health import build_flags_only, build_snapshot
+from .shelf_health import build_pulse, build_snapshot
 from .types import BinnedPoint, EntityInfo, EntityState, HistoryPoint
 
 
@@ -657,22 +657,31 @@ async def shelf_health_full() -> dict:
 
 
 @mcp.tool()
-async def shelf_flags_only() -> dict:
-    """Just the anomaly flags — the cheapest "anything wrong?" check.
+async def shelf_pulse() -> dict:
+    """Quick pulse check — vitals + anomaly flags in one small payload.
 
-    Fetches the same live states shelf_health_full needs, runs the flag
-    evaluators, but returns only the flag list + count summary. Use this
-    for periodic pulses during the day where you don't need the full category
-    breakdown — just whether something is newly wrong.
+    The mid-day "anything wrong + what are the key numbers" check. Returns a
+    compact `vitals` block of the sensors that matter most on a pulse:
+
+      - tank_center + tank_target + tank_delta (primary thermal)
+      - heater_power + heater_calling (is L1 firing as expected)
+      - tank_substrate (stratification sanity)
+      - tds_tank + tds_status (chemistry sanity)
+      - shelf_ambient + outside_temp + basement_delta (envelope)
+      - forecast_5d_min_low (cold-snap horizon)
+      - l0_power (total shelf + printer draw)
+
+    Plus the full anomaly flag list (same evaluators as shelf_health_full). Use
+    this whenever you want a one-call health pulse without the full category
+    breakdown — ~1-1.5 KB response vs ~5 KB for shelf_health_full.
 
     Returns:
-        {timestamp, summary:{critical, warn, info}, flags:[{flag, level,
-         since?, message, known}, ...]}. Flags are sorted by severity.
-        Empty `flags` list means nothing is currently anomalous.
+        {timestamp, summary:{critical, warn, info}, vitals:{...numbers...},
+         flags:[{flag, level, since?, message, known}, ...]}
     """
     async with _client() as ha:
         try:
-            result = await build_flags_only(ha)
+            result = await build_pulse(ha)
         except HAError as e:
             return {"error": str(e)}
     return result

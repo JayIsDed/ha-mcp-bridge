@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from ha_mcp_bridge.shelf_health import compose_snapshot
+from ha_mcp_bridge.shelf_health import compose_snapshot, compose_vitals
 from ha_mcp_bridge.shelf_registry import SHELF_ENTITIES
 
 
@@ -156,6 +156,125 @@ def test_snapshot_response_size_reasonable() -> None:
     snap = compose_snapshot({}, SHELF_ENTITIES, NOW)
     size = len(json.dumps(snap, default=str))
     assert size < 20_000, f"empty snapshot is {size} bytes — check for payload bloat"
+
+
+# ─── compose_vitals ──────────────────────────────────────────────────────────
+
+
+def test_vitals_returns_none_fields_when_states_empty() -> None:
+    v = compose_vitals({}, SHELF_ENTITIES)
+    assert v["tank_center"] is None
+    assert v["tds_tank"] is None
+    assert v["heater_power"] is None
+    assert v["heater_calling"] is False
+
+
+def test_vitals_populates_tank_block() -> None:
+    states = {
+        "sensor.plant_shelf_temperatures_tank_center": mk_state(
+            "sensor.plant_shelf_temperatures_tank_center", "77.3"
+        ),
+        "sensor.plant_shelf_temperatures_tank_substrate": mk_state(
+            "sensor.plant_shelf_temperatures_tank_substrate", "77.1"
+        ),
+        "sensor.cal_shelf_inkbird_10g_current_consumption": mk_state(
+            "sensor.cal_shelf_inkbird_10g_current_consumption", "105.5"
+        ),
+        "climate.main_tank": mk_state(
+            "climate.main_tank",
+            "heat",
+            attrs={"hvac_action": "heating", "temperature": 77.0, "current_temperature": 77.3},
+        ),
+    }
+    v = compose_vitals(states, SHELF_ENTITIES)
+    assert v["tank_center"] == 77.3
+    assert v["tank_substrate"] == 77.1
+    assert v["tank_target"] == 77.0
+    assert v["tank_delta"] == 0.3
+    assert v["heater_power"] == 105.5
+    assert v["heater_calling"] is True
+
+
+def test_vitals_heater_not_calling_when_idle() -> None:
+    states = {
+        "climate.main_tank": mk_state(
+            "climate.main_tank",
+            "heat",
+            attrs={"hvac_action": "idle", "temperature": 77.0, "current_temperature": 77.3},
+        ),
+    }
+    v = compose_vitals(states, SHELF_ENTITIES)
+    assert v["heater_calling"] is False
+
+
+def test_vitals_tds_status_in_range() -> None:
+    states = {
+        "sensor.tank_chemistry_tds_tank": mk_state(
+            "sensor.tank_chemistry_tds_tank", "256"
+        ),
+    }
+    v = compose_vitals(states, SHELF_ENTITIES)
+    assert v["tds_tank"] == 256
+    assert v["tds_status"] == "in"
+
+
+def test_vitals_tds_status_above() -> None:
+    states = {
+        "sensor.tank_chemistry_tds_tank": mk_state(
+            "sensor.tank_chemistry_tds_tank", "400"
+        ),
+    }
+    v = compose_vitals(states, SHELF_ENTITIES)
+    assert v["tds_status"] == "above"
+
+
+def test_vitals_basement_delta_computed() -> None:
+    states = {
+        "sensor.plant_shelf_temperatures_shelf_ambient": mk_state(
+            "sensor.plant_shelf_temperatures_shelf_ambient", "62.0"
+        ),
+        "sensor.outside_temperature": mk_state("sensor.outside_temperature", "45"),
+    }
+    v = compose_vitals(states, SHELF_ENTITIES)
+    assert v["shelf_ambient"] == 62.0
+    assert v["outside_temp"] == 45.0
+    assert v["basement_delta"] == 17.0
+
+
+def test_vitals_response_size_tiny() -> None:
+    """A full vitals block (all fields populated) should stay under 500 bytes."""
+    import json
+
+    states = {
+        "sensor.plant_shelf_temperatures_tank_center": mk_state(
+            "sensor.plant_shelf_temperatures_tank_center", "77.3"
+        ),
+        "sensor.plant_shelf_temperatures_tank_substrate": mk_state(
+            "sensor.plant_shelf_temperatures_tank_substrate", "77.1"
+        ),
+        "sensor.cal_shelf_inkbird_10g_current_consumption": mk_state(
+            "sensor.cal_shelf_inkbird_10g_current_consumption", "105.5"
+        ),
+        "sensor.tank_chemistry_tds_tank": mk_state(
+            "sensor.tank_chemistry_tds_tank", "256"
+        ),
+        "sensor.plant_shelf_temperatures_shelf_ambient": mk_state(
+            "sensor.plant_shelf_temperatures_shelf_ambient", "62.0"
+        ),
+        "sensor.outside_temperature": mk_state("sensor.outside_temperature", "45"),
+        "sensor.outside_5_day_min_low": mk_state("sensor.outside_5_day_min_low", "38"),
+        "sensor.3d_printer_strip_current_consumption": mk_state(
+            "sensor.3d_printer_strip_current_consumption", "148"
+        ),
+        "climate.main_tank": mk_state(
+            "climate.main_tank",
+            "heat",
+            attrs={"hvac_action": "heating", "temperature": 77.0, "current_temperature": 77.3},
+        ),
+    }
+    v = compose_vitals(states, SHELF_ENTITIES)
+    size = len(json.dumps(v, default=str))
+    assert size < 500
 
 
 def test_snapshot_skips_inactive_entities() -> None:

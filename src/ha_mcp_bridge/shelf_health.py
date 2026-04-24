@@ -258,13 +258,109 @@ async def build_snapshot(ha: HAClient) -> dict[str, Any]:
     return compose_snapshot(states)
 
 
-async def build_flags_only(ha: HAClient) -> dict[str, Any]:
-    """Just the flag output — cheapest "anything wrong?" check."""
+def compose_vitals(
+    states: dict[str, dict[str, Any]],
+    registry: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Tight "at-a-glance" vitals block — the numbers you want whether or not
+    flags are firing. Always populated even on a fully healthy shelf.
+
+    Pure function — no I/O.
+    """
+    if registry is None:
+        registry = SHELF_ENTITIES
+
+    def _val(key: str) -> float | None:
+        entry = registry.get(key)
+        if not entry:
+            return None
+        raw = states.get(entry["entity_id"])
+        if not raw:
+            return None
+        s = raw.get("state")
+        if s in (None, "unavailable", "unknown", "none", ""):
+            return None
+        try:
+            return float(s)
+        except (TypeError, ValueError):
+            return None
+
+    def _round(v: float | None, digits: int = 2) -> float | None:
+        return round(v, digits) if v is not None else None
+
+    # Tank thermal vitals
+    tank_center = _val("tank_center")
+    tank_target = registry.get("tank_center", {}).get("target")
+
+    # Pull live climate target if available (follows runtime setpoint changes).
+    climate_raw = states.get("climate.main_tank")
+    if climate_raw:
+        attrs = climate_raw.get("attributes") or {}
+        try:
+            tank_target = float(attrs.get("temperature"))
+        except (TypeError, ValueError):
+            pass
+    heater_calling = False
+    if climate_raw:
+        heater_calling = (climate_raw.get("attributes") or {}).get("hvac_action") == "heating"
+
+    tank_delta = None
+    if tank_center is not None and tank_target is not None:
+        tank_delta = tank_center - tank_target
+
+    # Chemistry
+    tds_tank = _val("tds_tank")
+    tds_status: str | None = None
+    if tds_tank is not None:
+        rng = registry.get("tds_tank", {}).get("range")
+        if rng:
+            lo, hi = rng
+            if lo <= tds_tank <= hi:
+                tds_status = "in"
+            elif tds_tank > hi:
+                tds_status = "above"
+            else:
+                tds_status = "below"
+
+    vitals: dict[str, Any] = {
+        # Tank thermal
+        "tank_center": _round(tank_center),
+        "tank_target": tank_target,
+        "tank_delta": _round(tank_delta),
+        "heater_power": _round(_val("heater_power"), 1),
+        "heater_calling": heater_calling,
+        "tank_substrate": _round(_val("tank_substrate")),
+        # Chemistry
+        "tds_tank": _round(tds_tank, 0) if tds_tank is not None else None,
+        "tds_status": tds_status,
+        # Ambient
+        "shelf_ambient": _round(_val("shelf_ambient"), 1),
+        "outside_temp": _round(_val("outside_temp"), 0),
+        "forecast_5d_min_low": _round(_val("forecast_5d_min_low"), 0),
+        # Power envelope
+        "l0_power": _round(_val("l0_power"), 1),
+        # Derived
+        "basement_delta": (
+            _round(_val("shelf_ambient") - _val("outside_temp"), 1)
+            if _val("shelf_ambient") is not None and _val("outside_temp") is not None
+            else None
+        ),
+    }
+    return vitals
+
+
+async def build_pulse(ha: HAClient) -> dict[str, Any]:
+    """Quick pulse — vitals + flags in one small payload.
+
+    Use this as the mid-day "anything wrong + what are the key numbers" check.
+    Returns a compact block of the sensors you care about most (tank temp,
+    heater power, TDS, ambient, weather), plus the anomaly flag list.
+    """
     eids = active_entity_ids()
     states = await fetch_states(ha, eids)
     now = datetime.now(timezone.utc)
-    flags = evaluate_all(states, SHELF_ENTITIES, now)
 
+    flags = evaluate_all(states, SHELF_ENTITIES, now)
     flag_counts = {"critical": 0, "warn": 0, "info": 0}
     for f in flags:
         lvl = f.get("level", "info")
@@ -274,5 +370,6 @@ async def build_flags_only(ha: HAClient) -> dict[str, Any]:
     return {
         "timestamp": now.isoformat(),
         "summary": flag_counts,
+        "vitals": compose_vitals(states, SHELF_ENTITIES),
         "flags": flags,
     }
