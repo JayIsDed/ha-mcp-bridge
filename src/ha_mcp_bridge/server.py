@@ -16,6 +16,7 @@ from PIL import Image as PILImage
 
 from .ha_client import HAClient, HAError
 from .influx_client import InfluxClient, InfluxError
+from .shelf_health import build_pulse, build_snapshot
 from .types import BinnedPoint, EntityInfo, EntityState, HistoryPoint
 
 
@@ -610,6 +611,80 @@ async def ha_template(template: str) -> dict:
             return {"error": str(e)}
 
     return {"ok": True, "rendered": rendered}
+
+
+@mcp.tool()
+async def shelf_health_full() -> dict:
+    """Full calibration-shelf health snapshot in one call.
+
+    Replaces the 20-call parallel ha_state sweep that a manual morning check
+    otherwise needs. Returns live values grouped by category (thermal, chemistry,
+    power, climate, light, camera, weather, infrastructure), plus a list of
+    anomaly flags evaluated against the registry-defined bounds.
+
+    Categories populated depend on which entities are currently `active` in the
+    shelf registry (src/ha_mcp_bridge/shelf_registry.py). Entities gated off
+    (e.g. TDS probe not physically plugged in) are skipped silently. Adding a
+    new sensor = one line in the registry; this tool picks it up on next call.
+
+    Flags surface issues that a raw state dump would hide:
+      - canopy_offline (known-off board still dark)
+      - bucket_phantom_heat (climate calling heat with 0W actual draw)
+      - tank_band_breach (tank_center outside climate target ± flag_band)
+      - tds_out_of_range (chemistry drift beyond organism-safe bounds)
+      - stratification (tank top vs substrate delta >1°F)
+      - heater_overdraw (>150W = element fault)
+      - basement_cold_drift (ambient <60°F)
+      - sensor_stale (active sensor >30min without update)
+
+    Returns:
+        {timestamp, summary:{active_entities, offline, flags:{critical,warn,info}},
+         flags:[...], thermal:{...}, chemistry:{...}, power:{...}, climate:{...},
+         light:{...}, weather:{...}, infrastructure:{...}}
+        Sections are omitted when empty. Typical response ≈ 2-3 KB.
+    """
+    async with _client() as ha:
+        try:
+            snapshot = await build_snapshot(ha)
+        except HAError as e:
+            return {"error": str(e)}
+
+    hint = (
+        "Registry grew too large for the response cap. Split into category-specific "
+        "tools or filter the registry before composing the snapshot."
+    )
+    return _guard_dict("shelf_health_full", snapshot, hint)
+
+
+@mcp.tool()
+async def shelf_pulse() -> dict:
+    """Quick pulse check — vitals + anomaly flags in one small payload.
+
+    The mid-day "anything wrong + what are the key numbers" check. Returns a
+    compact `vitals` block of the sensors that matter most on a pulse:
+
+      - tank_center + tank_target + tank_delta (primary thermal)
+      - heater_power + heater_calling (is L1 firing as expected)
+      - tank_substrate (stratification sanity)
+      - tds_tank + tds_status (chemistry sanity)
+      - shelf_ambient + outside_temp + basement_delta (envelope)
+      - forecast_5d_min_low (cold-snap horizon)
+      - l0_power (total shelf + printer draw)
+
+    Plus the full anomaly flag list (same evaluators as shelf_health_full). Use
+    this whenever you want a one-call health pulse without the full category
+    breakdown — ~1-1.5 KB response vs ~5 KB for shelf_health_full.
+
+    Returns:
+        {timestamp, summary:{critical, warn, info}, vitals:{...numbers...},
+         flags:[{flag, level, since?, message, known}, ...]}
+    """
+    async with _client() as ha:
+        try:
+            result = await build_pulse(ha)
+        except HAError as e:
+            return {"error": str(e)}
+    return result
 
 
 def main() -> None:
