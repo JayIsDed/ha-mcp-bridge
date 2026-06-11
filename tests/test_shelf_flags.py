@@ -420,6 +420,58 @@ def test_sensor_stale_skips_known_offline_canopy() -> None:
     assert not any("canopy" in s for s in stale_ids)
 
 
+def test_sensor_stale_canopy_illuminance_dark_is_known_info() -> None:
+    """Illuminance sensor stale at its dark floor (0lx) → expected, info/known,
+    not a warn. A delta-reporting lux sensor idles overnight when truly dark.
+    """
+    states = mk_recent_states()
+    states["sensor.plant_shelf_canopy_canopy_illuminance"] = mk_state(
+        "sensor.plant_shelf_canopy_canopy_illuminance",
+        "0.0",
+        last_changed=NOW - timedelta(hours=8),
+    )
+    flags = flag_sensor_stale(states, SHELF_ENTITIES, NOW)
+    illum = [f for f in flags if f["flag"] == "sensor_stale:canopy_illuminance"]
+    assert len(illum) == 1
+    assert illum[0]["level"] == "info"
+    assert illum[0]["known"] is True
+
+
+def test_sensor_stale_canopy_illuminance_lit_still_warns() -> None:
+    """Illuminance sensor frozen while reading meaningful light (above the dark
+    threshold) is a real stall → warn, not known. This is the failure case the
+    dark-gate must NOT mask.
+    """
+    states = mk_recent_states()
+    states["sensor.plant_shelf_canopy_canopy_illuminance"] = mk_state(
+        "sensor.plant_shelf_canopy_canopy_illuminance",
+        "450",
+        last_changed=NOW - timedelta(hours=8),
+    )
+    flags = flag_sensor_stale(states, SHELF_ENTITIES, NOW)
+    illum = [f for f in flags if f["flag"] == "sensor_stale:canopy_illuminance"]
+    assert len(illum) == 1
+    assert illum[0]["level"] == "warn"
+    assert illum[0]["known"] is False
+
+
+def test_sensor_stale_dark_gate_is_entry_specific() -> None:
+    """The dark-lux gate only applies to entries that declare stale_dark_lux. A
+    stale thermal sensor still warns even at a low numeric value.
+    """
+    states = mk_recent_states()
+    states["sensor.plant_shelf_temperatures_tank_center"] = mk_state(
+        "sensor.plant_shelf_temperatures_tank_center",
+        "0.0",  # no stale_dark_lux on this entry → must still warn
+        last_changed=NOW - timedelta(minutes=45),
+    )
+    flags = flag_sensor_stale(states, SHELF_ENTITIES, NOW)
+    tc = [f for f in flags if f["flag"] == "sensor_stale:tank_center"]
+    assert len(tc) == 1
+    assert tc[0]["level"] == "warn"
+    assert tc[0]["known"] is False
+
+
 # ─── evaluate_all integration ─────────────────────────────────────────────────
 
 

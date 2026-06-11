@@ -393,6 +393,28 @@ def flag_sensor_stale(
         if secs is None or secs <= STALE_SECONDS:
             continue
 
+        # Illuminance sensors that delta-report legitimately idle in the dark: a
+        # lux sensor sitting at its dark floor (~0 lx) stops emitting changes, which
+        # reads as stale even though the board is healthy. When such a sensor is
+        # stale *and* its last value is below the entry's configured dark threshold,
+        # treat it as expected (info/known) rather than warn. A sensor frozen while
+        # reading meaningful light is a genuine stall and still warns.
+        dark_lux = entry.get("stale_dark_lux")
+        value = _state_value(raw)
+        if dark_lux is not None and value is not None and value < dark_lux:
+            flags.append({
+                "flag": f"sensor_stale:{key}",
+                "level": "info",
+                "since": lc.isoformat() if lc else None,
+                "message": (
+                    f"{key} ({entry['entity_id']}) idle at {value:.1f}lx for "
+                    f"{secs / 60:.0f} min — expected: delta-reporting lux sensor sits "
+                    f"at its dark floor and resumes when light returns."
+                ),
+                "known": True,
+            })
+            continue
+
         flags.append({
             "flag": f"sensor_stale:{key}",
             "level": "warn",

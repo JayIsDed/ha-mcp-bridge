@@ -34,6 +34,11 @@ Entry schema (see `EntitySpec` below for the typed version):
     gated_by:    str         entity_id of a switch that enables/disables this sensor
     powered_by:  str         entity_id of the outlet powering the device this sensor
                              observes — used by phantom-heat style flags
+    stale_dark_lux: float    illuminance sensors only — if the sensor goes stale (stops
+                             reporting) while its value is below this lux threshold, the
+                             staleness is expected (a delta-reporting lux sensor idles at
+                             its dark floor) and is flagged info/known instead of warn.
+                             A stale read ABOVE the threshold is a real stall → warn.
 """
 
 from __future__ import annotations
@@ -62,6 +67,7 @@ class EntitySpec:
     known_state: str | None = None
     gated_by: str | None = None
     powered_by: str | None = None
+    stale_dark_lux: float | None = None
     notes: str | None = None
 
 
@@ -131,7 +137,6 @@ SHELF_ENTITIES: dict[str, dict[str, Any]] = {
         "role": "air_temp",
         "unit": "°F",
         "active": True,
-        "known_state": "Board offline since 2026-04-22.",
     },
     "canopy_humidity": {
         "entity_id": "sensor.plant_shelf_canopy_canopy_humidity",
@@ -140,7 +145,6 @@ SHELF_ENTITIES: dict[str, dict[str, Any]] = {
         "role": "humidity",
         "unit": "%",
         "active": True,
-        "known_state": "Board offline since 2026-04-22.",
     },
     "canopy_illuminance": {
         "entity_id": "sensor.plant_shelf_canopy_canopy_illuminance",
@@ -149,7 +153,14 @@ SHELF_ENTITIES: dict[str, dict[str, Any]] = {
         "role": "illuminance",
         "unit": "lx",
         "active": True,
-        "known_state": "Board offline since 2026-04-22.",
+        "stale_dark_lux": 10.0,
+        "notes": (
+            "BH1750 delta-reports; idles at its dark floor (observed 0.0lx) overnight "
+            "with grow + room lights off, which trips sensor_stale. stale_dark_lux gates "
+            "that to info/known (residual equipment glow ~4.8lx stays noisy enough to "
+            "self-clear; lit readings are hundreds+). A stale read above 10lx is a real "
+            "stall → warn. Confirmed 2026-06-11 via deliberate basement-light ping."
+        ),
     },
 
     # ═══ Water chemistry (tank_chemistry board, XIAO ESP32-C6 + ADS1115) ═════
