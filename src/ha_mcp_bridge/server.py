@@ -16,6 +16,7 @@ from PIL import Image as PILImage
 
 from .ha_client import HAClient, HAError
 from .influx_client import InfluxClient, InfluxError
+from .archbox_health import build_archbox_pulse
 from .shelf_health import build_pulse, build_snapshot
 from .types import BinnedPoint, EntityInfo, EntityState, HistoryPoint
 
@@ -682,6 +683,45 @@ async def shelf_pulse() -> dict:
     async with _client() as ha:
         try:
             result = await build_pulse(ha)
+        except HAError as e:
+            return {"error": str(e)}
+    return result
+
+
+@mcp.tool()
+async def archbox_pulse() -> dict:
+    """One-call health bundle for the archbox (jay's 7950X / RTX 3090 rig).
+
+    The workstation equivalent of shelf_pulse. Prefer this over firing several
+    ha_state calls whenever the question is "how's the archbox" / "is it hot" /
+    "what's it drawing" / "is it even on". Response ~1 KB.
+
+    vitals:
+      thermals  cpu_temp, gpu_temp, gpu_hotspot, gpu_vram, gpu_vrm,
+                coolant_temp (water loop), nvme_temp (hottest of 4)
+      load      cpu_load, gpu_load, memory_used
+      power     gpu_power, wall_power (WHOLE system at the plug, incl. PSU
+                losses), line_voltage, today_kwh, month_kwh
+      state     power_switch (WoL on / authenticated poweroff), mains_switch
+      derived   non_gpu_power (wall - gpu), gpu_over_coolant (how hard the loop
+                is working), hotspot_delta (core-to-hotspot; a high value is
+                the classic degraded-paste tell)
+
+    flags: per-metric warn/critical thresholds tuned for THIS hardware, plus
+    archbox_offline, sensor_unavailable:*, mains_off_while_on, and
+    hotspot_delta_high.
+
+    Data path: telegraf (archbox) -> InfluxDB "hosts" -> HA influxdb sensors.
+    If the box is off, telemetry goes stale and `online` reports false — wake it
+    with switch.archbox. Full hardware notes: ai-lab/docs/archbox-monitoring.md.
+
+    Returns:
+        {timestamp, online, summary:{critical, warn, info},
+         vitals:{...}, flags:[{flag, level, message, known}, ...]}
+    """
+    async with _client() as ha:
+        try:
+            result = await build_archbox_pulse(ha)
         except HAError as e:
             return {"error": str(e)}
     return result
