@@ -16,7 +16,7 @@ from PIL import Image as PILImage
 
 from .ha_client import HAClient, HAError
 from .influx_client import InfluxClient, InfluxError
-from .archbox_health import build_archbox_pulse
+from .archbox_health import build_archbox_full, build_archbox_pulse
 from .shelf_health import build_pulse, build_snapshot
 from .types import BinnedPoint, EntityInfo, EntityState, HistoryPoint
 
@@ -39,6 +39,10 @@ INFLUX_URL = os.environ.get("INFLUX_URL", "")
 INFLUX_TOKEN = os.environ.get("INFLUX_TOKEN", "")
 INFLUX_ORG = os.environ.get("INFLUX_ORG", "homelab")
 INFLUX_TIMEOUT = float(os.environ.get("INFLUX_HTTP_TIMEOUT", "30"))
+# Separate read-only token scoped to the `hosts` bucket only. INFLUX_TOKEN
+# cannot see that bucket (returns 404), and broadening it would hand this
+# bridge more than it needs.
+INFLUX_HOSTS_TOKEN = os.environ.get("INFLUX_HOSTS_TOKEN", "")
 
 # Responses larger than this serialize to more than a single pipe buffer (64KB default
 # on Linux) and will hang the MCP stdio transport if the client isn't draining fast
@@ -725,6 +729,57 @@ async def archbox_pulse() -> dict:
         except HAError as e:
             return {"error": str(e)}
     return result
+
+
+@mcp.tool()
+async def archbox_health_full() -> dict:
+    """FULL archbox sensor suite, sectioned — every channel, not just the vitals.
+
+    The broad read. `archbox_pulse()` is the headline numbers (~550 B); this is
+    everything the rig exposes (~2 KB), grouped so you can scan one subsystem at
+    a time. Reads InfluxDB directly rather than the 11 HA convenience sensors,
+    so multi-sensor arrays come back as arrays.
+
+    Sections:
+      cpu           tctl, per-CCD (ccd1/ccd2), load%, load1/5/15, threads,
+                    process + running counts
+      gpu_die       temp, hotspot, gpu2, hotspot_delta, util%, mem-util%,
+                    pstate, graphics/sm/memory clocks, pcie gen + width
+      gpu_memory    MEM1-3 (the TRUSTWORTHY GDDR6X readings), vram_junction
+                    (flaky per upstream), used/total MiB
+      gpu_vrm       pwr1..pwr5 power-stage sensors
+      gpu_fans_rpm  fan0/1/2 REAL rpm (nvidia-smi only gives a %, reported
+                    separately as gpu_fan_driver_pct)
+      loop          coolant_temp, chassis_fans_rpm (fan1..fan6),
+                    gpu_over_coolant
+      board         NCT6686D thermistors
+      memory        dimm_temps[] (all 4 DDR5), used%, used/total GiB, swap%
+      storage       nvme_composite_temps[] (all 4 drives) + per-sensor arrays,
+                    filesystems_used_pct by mount (incl. /srv/ai-models)
+      network       nic_temp, wifi_temp
+      power         wall_w (WHOLE system at the plug), gpu_w, non_gpu_w,
+                    gpu_limit_w, line_v, today/month kWh, mains_switch
+      plus          igpu_temp, uptime_hours, online, summary, flags
+
+    Known-empty by design: chassis fan2 reads 0 (empty header — the 6th T30 is
+    on a motherboard header, and the NCT6796D-S is dead under Linux).
+
+    Flags use the same thresholds as archbox_pulse, so the two never disagree,
+    plus disk_full:<path> at >=90%.
+
+    Returns:
+        {timestamp, online, cpu, gpu_die, gpu_memory, gpu_vrm, gpu_fans_rpm,
+         loop, board, memory, storage, network, power, summary, flags, ...}
+    """
+    if not INFLUX_URL or not INFLUX_HOSTS_TOKEN:
+        return {"error": "INFLUX_URL and INFLUX_HOSTS_TOKEN must be set in env/.env."}
+    influx = InfluxClient(INFLUX_URL, INFLUX_HOSTS_TOKEN, INFLUX_ORG, timeout=INFLUX_TIMEOUT)
+    async with _client() as ha, influx:
+        try:
+            result = await build_archbox_full(ha, influx)
+        except (HAError, InfluxError) as e:
+            return {"error": str(e)}
+    return _guard_dict("archbox_health_full", result, "narrow the range or use archbox_pulse()")
 
 
 def main() -> None:

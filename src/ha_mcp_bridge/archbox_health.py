@@ -165,3 +165,260 @@ async def build_archbox_pulse(ha: HAClient) -> dict[str, Any]:
     entity_ids = list(ARCHBOX_ENTITIES.values()) + list(ARCHBOX_SWITCHES.values())
     states = await fetch_states(ha, entity_ids)
     return compose_archbox(states, datetime.now(timezone.utc))
+
+
+# =========================================================================
+# FULL SUITE — everything, sectioned. Reads InfluxDB directly rather than the
+# 11 HA convenience sensors, so it reaches all 11 iCX3 channels, all 3 GPU
+# fans, all 6 chassis fans, and every DIMM/drive as an ARRAY. Power still
+# comes from HA, because the smart plug is the only source of wall draw.
+# =========================================================================
+
+# One query, last() per series. Deliberately selective: `cpu` alone has 33
+# tag values x 11 fields, and `diskio` 17 x 14 — pulling everything would be
+# thousands of series for a "glance" tool.
+FULL_FLUX = """
+from(bucket: "hosts")
+  |> range(start: -5m)
+  |> filter(fn: (r) =>
+       r._measurement == "temp"
+       or (r._measurement == "temp_detail" and (r.chip == "nvme" or r.chip == "spd5118"))
+       or r._measurement == "icx3_temp"
+       or r._measurement == "icx3_fan"
+       or (r._measurement == "nvidia_smi" and (
+             r._field == "temperature_gpu" or r._field == "power_draw"
+             or r._field == "power_limit" or r._field == "utilization_gpu"
+             or r._field == "utilization_memory" or r._field == "memory_used"
+             or r._field == "memory_total" or r._field == "fan_speed"
+             or r._field == "clocks_current_graphics" or r._field == "clocks_current_sm"
+             or r._field == "clocks_current_memory"
+             or r._field == "pcie_link_gen_current" or r._field == "pcie_link_width_current"))
+       or (r._measurement == "prometheus" and r.device =~ /Commander/)
+       or (r._measurement == "cpu" and r.cpu == "cpu-total" and r._field == "usage_active")
+       or (r._measurement == "mem" and (r._field == "used_percent" or r._field == "used" or r._field == "total"))
+       or (r._measurement == "swap" and r._field == "used_percent")
+       or (r._measurement == "system" and (
+             r._field == "load1" or r._field == "load5" or r._field == "load15"
+             or r._field == "uptime" or r._field == "n_cpus"))
+       or (r._measurement == "disk" and r._field == "used_percent")
+       or (r._measurement == "processes" and (r._field == "total" or r._field == "running"))
+  )
+  |> last()
+"""
+
+
+def _num(row: dict[str, Any]) -> float | None:
+    v = row.get("_value")
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        return float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def compose_archbox_full(
+    rows: list[dict[str, Any]],
+    states: dict[str, dict[str, Any]],
+    now: datetime,
+) -> dict[str, Any]:
+    """Pure function: influx rows + HA states -> sectioned snapshot."""
+    temps: dict[str, list[float]] = {}
+    icx: dict[str, float] = {}
+    fans_gpu: dict[str, float] = {}
+    nv: dict[str, float] = {}
+    cc_temp: dict[str, float] = {}
+    cc_fan: dict[str, float] = {}
+    host: dict[str, float] = {}
+    disks: dict[str, float] = {}
+    # temp_detail carries a per-device tag, so these really are per-drive and
+    # per-DIMM. inputs.temp cannot distinguish them — all 4 drives share the
+    # single `sensor=nvme_composite` value, and all 4 DIMMs share `spd5118`.
+    detail: dict[str, dict[str, dict[str, float]]] = {}
+    pstate = None
+
+    for r in rows:
+        m, f, val = r.get("_measurement"), r.get("_field"), _num(r)
+        if val is None:
+            continue
+        if m == "temp_detail":
+            chip = str(r.get("chip"))
+            detail.setdefault(chip, {}).setdefault(str(r.get("dev")), {})[
+                str(r.get("label"))
+            ] = _round(val)  # type: ignore[assignment]
+        elif m == "temp":
+            temps.setdefault(str(r.get("sensor")), []).append(val)
+        elif m == "icx3_temp":
+            icx[str(r.get("sensor"))] = val
+        elif m == "icx3_fan":
+            fans_gpu[f"fan{r.get('fan')}"] = val
+        elif m == "nvidia_smi":
+            nv[str(f)] = val
+            pstate = r.get("pstate") or pstate
+        elif m == "prometheus":
+            if f == "coolercontrol_temperature_celsius":
+                cc_temp[str(r.get("sensor"))] = val
+            elif f == "coolercontrol_fan_rpm":
+                cc_fan[str(r.get("channel"))] = val
+        elif m == "disk":
+            disks[str(r.get("path"))] = val
+        else:
+            host[f"{m}_{f}"] = val
+
+    def t(name: str) -> float | None:
+        vals = temps.get(name)
+        return _round(vals[0]) if vals else None
+
+    def tlist(name: str) -> list[float]:
+        return sorted(_round(v) for v in temps.get(name, []))  # type: ignore[misc]
+
+    def ha_num(entity: str) -> float | None:
+        return _round(_numeric((states.get(entity) or {}).get("state")))
+
+    wall = ha_num("sensor.pc_strip_current_consumption")
+    gpu_w = _round(nv.get("power_draw"))
+    gpu_t = _round(nv.get("temperature_gpu"))
+    coolant = _round(cc_temp.get("temp0"))
+    hotspot = _round(icx.get("hotspot"))
+
+    snapshot: dict[str, Any] = {
+        "timestamp": now.isoformat(),
+        "online": (states.get("switch.archbox") or {}).get("state") == "on",
+        "cpu": {
+            "tctl": t("k10temp_tctl"),
+            "ccd1": t("k10temp_tccd1"),
+            "ccd2": t("k10temp_tccd2"),
+            "load_pct": _round(host.get("cpu_usage_active")),
+            "load1": _round(host.get("system_load1"), 2),
+            "load5": _round(host.get("system_load5"), 2),
+            "load15": _round(host.get("system_load15"), 2),
+            "threads": int(host["system_n_cpus"]) if "system_n_cpus" in host else None,
+            "processes": int(host["processes_total"]) if "processes_total" in host else None,
+            "running": int(host["processes_running"]) if "processes_running" in host else None,
+        },
+        "gpu_die": {
+            "temp": gpu_t,
+            "hotspot": hotspot,
+            "gpu2": _round(icx.get("gpu2")),
+            "hotspot_delta": _round(hotspot - gpu_t) if hotspot is not None and gpu_t is not None else None,
+            "util_pct": _round(nv.get("utilization_gpu")),
+            "mem_util_pct": _round(nv.get("utilization_memory")),
+            "pstate": pstate,
+            "clock_graphics_mhz": _round(nv.get("clocks_current_graphics"), 0),
+            "clock_sm_mhz": _round(nv.get("clocks_current_sm"), 0),
+            "clock_memory_mhz": _round(nv.get("clocks_current_memory"), 0),
+            "pcie_gen": _round(nv.get("pcie_link_gen_current"), 0),
+            "pcie_width": _round(nv.get("pcie_link_width_current"), 0),
+        },
+        # MEM1-3 are the trustworthy GDDR6X readings; vram/hotspot are flaky
+        # per evga-icx's own author.
+        "gpu_memory": {
+            "mem1": _round(icx.get("mem1")), "mem2": _round(icx.get("mem2")),
+            "mem3": _round(icx.get("mem3")),
+            "vram_junction": _round(icx.get("vram")),
+            "used_mib": _round(nv.get("memory_used"), 0),
+            "total_mib": _round(nv.get("memory_total"), 0),
+        },
+        "gpu_vrm": {f"pwr{i}": _round(icx.get(f"pwr{i}")) for i in range(1, 6)},
+        "gpu_fans_rpm": {k: _round(v, 0) for k, v in sorted(fans_gpu.items())},
+        "gpu_fan_driver_pct": _round(nv.get("fan_speed")),
+        # fan2 reads 0 — empty header. The 6th T30 is on a motherboard header
+        # and is unreadable (NCT6796D-S is dead under Linux).
+        "loop": {
+            "coolant_temp": coolant,
+            "chassis_fans_rpm": {k: _round(v, 0) for k, v in sorted(cc_fan.items())},
+            "gpu_over_coolant": _round(gpu_t - coolant) if gpu_t is not None and coolant is not None else None,
+        },
+        "board": {k.replace("nct6686_", ""): t(k) for k in sorted(temps) if k.startswith("nct6686_")},
+        "memory": {
+            # per-module, keyed by SMBus address (9-0050 .. 9-0053)
+            "dimm_temps": {
+                dev: vals.get("temp1")
+                for dev, vals in sorted(detail.get("spd5118", {}).items())
+            } or {"_all": tlist("spd5118")},
+            "used_pct": _round(host.get("mem_used_percent")),
+            "used_gib": _round((host.get("mem_used") or 0) / 1024**3, 1) if "mem_used" in host else None,
+            "total_gib": _round((host.get("mem_total") or 0) / 1024**3, 1) if "mem_total" in host else None,
+            "swap_used_pct": _round(host.get("swap_used_percent")),
+        },
+        "storage": {
+            # per-drive: {nvme0: {Composite, Sensor_1, Sensor_2}, ...}
+            "nvme": {dev: vals for dev, vals in sorted(detail.get("nvme", {}).items())}
+            or {"_all_composite": tlist("nvme_composite")},
+            "filesystems_used_pct": {k: _round(v) for k, v in sorted(disks.items())},
+        },
+        "network": {"nic_temp": t("r8169_0_4d00:00"), "wifi_temp": t("iwlwifi_1")},
+        "igpu_temp": t("amdgpu_edge"),
+        "power": {
+            "wall_w": wall,
+            "gpu_w": gpu_w,
+            "gpu_limit_w": _round(nv.get("power_limit"), 0),
+            "non_gpu_w": _round(wall - gpu_w) if wall is not None and gpu_w is not None else None,
+            "line_v": ha_num("sensor.pc_strip_voltage"),
+            "today_kwh": ha_num("sensor.pc_strip_today_s_consumption"),
+            "month_kwh": ha_num("sensor.pc_strip_this_month_s_consumption"),
+            "mains_switch": (states.get("switch.pc_strip") or {}).get("state", "unknown"),
+        },
+        "uptime_hours": _round((host.get("system_uptime") or 0) / 3600, 1) if "system_uptime" in host else None,
+    }
+
+    # reuse the pulse's threshold evaluators so full and pulse never disagree
+    pulse_view = {
+        "cpu_temp": snapshot["cpu"]["tctl"], "gpu_temp": gpu_t,
+        "gpu_hotspot": hotspot, "gpu_vram": snapshot["gpu_memory"]["vram_junction"],
+        "gpu_vrm": max([v for v in snapshot["gpu_vrm"].values() if v is not None], default=None),
+        "coolant_temp": coolant,
+        "nvme_temp": max(
+            [
+                v.get("Composite")
+                for v in snapshot["storage"]["nvme"].values()
+                if isinstance(v, dict) and v.get("Composite") is not None
+            ],
+            default=None,
+        ),
+    }
+    flags: list[dict[str, Any]] = []
+    if not snapshot["online"]:
+        flags.append({"flag": "archbox_offline", "level": "info", "known": True,
+                      "message": "archbox is powered off; telemetry is stale."})
+    for key, (warn, crit) in THRESHOLDS.items():
+        val = pulse_view.get(key)
+        if val is None:
+            continue
+        if val >= crit:
+            flags.append({"flag": f"{key}_critical", "level": "critical", "known": False,
+                          "message": f"{key} = {val}C (critical >= {crit}C)"})
+        elif val >= warn:
+            flags.append({"flag": f"{key}_warn", "level": "warn", "known": False,
+                          "message": f"{key} = {val}C (warn >= {warn}C)"})
+    hd = snapshot["gpu_die"]["hotspot_delta"]
+    if hd is not None and hd >= 25:
+        flags.append({"flag": "hotspot_delta_high", "level": "warn", "known": False,
+                      "message": f"core-to-hotspot delta {hd}C — degraded paste or bad mount."})
+    for path, pct in snapshot["storage"]["filesystems_used_pct"].items():
+        if pct is not None and pct >= 90:
+            flags.append({"flag": f"disk_full:{path}", "level": "warn", "known": False,
+                          "message": f"{path} is {pct}% full"})
+
+    snapshot["summary"] = {
+        "critical": sum(1 for f in flags if f["level"] == "critical"),
+        "warn": sum(1 for f in flags if f["level"] == "warn"),
+        "info": sum(1 for f in flags if f["level"] == "info"),
+    }
+    snapshot["flags"] = flags
+    return snapshot
+
+
+async def build_archbox_full(ha: HAClient, influx: Any) -> dict[str, Any]:
+    """Query InfluxDB for the whole sensor suite + HA for power, then compose."""
+    rows = await influx.query(FULL_FLUX)
+    states = await fetch_states(
+        ha,
+        [
+            "switch.archbox", "switch.pc_strip",
+            "sensor.pc_strip_current_consumption", "sensor.pc_strip_voltage",
+            "sensor.pc_strip_today_s_consumption",
+            "sensor.pc_strip_this_month_s_consumption",
+        ],
+    )
+    return compose_archbox_full(rows, states, datetime.now(timezone.utc))
