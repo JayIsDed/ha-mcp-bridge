@@ -76,8 +76,8 @@ async def test_area_targeting_blocked(server_mod) -> None:
     out = await server_mod.ha_call_service(
         "light", "turn_on", {"area_id": "plant_shelf"}
     )
-    assert out["error"] == "entity_required"
-    assert "Area/device" in out["hint"]
+    assert out["error"] == "target_not_allowed"
+    assert out["keys"] == ["area_id"]
 
 
 async def test_list_entity_partial_denied(server_mod) -> None:
