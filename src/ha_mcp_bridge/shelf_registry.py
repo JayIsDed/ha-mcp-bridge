@@ -48,8 +48,8 @@ Entry schema (see `EntitySpec` below for the typed version):
                              dark, entity_offline raises one flag for the device.
     offline_after_s: int     how long this entity may be dark before entity_offline
                              flags it, in place of the flag's default (10 min). The
-                             pump uses 5 min: its outlet never dropped in 64 days of
-                             recent history, and its earlier drops were real outages.
+                             pump uses 5 min: its outlet hasn't dropped once in 64 days,
+                             so 5 min only has to clear an HA restart.
 """
 
 from __future__ import annotations
