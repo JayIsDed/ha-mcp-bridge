@@ -35,7 +35,12 @@ def _states(**overrides):
     for key, val in overrides.items():
         eid = ARCHBOX_ENTITIES.get(key) or ARCHBOX_SWITCHES.get(key) or key
         base[eid] = val
-    return {eid: {"state": val} for eid, val in base.items()}
+    # HA stamps every state; fresh as of NOW, as a polled sensor would be.
+    ts = NOW.isoformat()
+    return {
+        eid: {"state": val, "last_updated": ts, "last_reported": ts}
+        for eid, val in base.items()
+    }
 
 
 def test_healthy_idle_has_no_flags():

@@ -39,6 +39,17 @@ Entry schema (see `EntitySpec` below for the typed version):
                              staleness is expected (a delta-reporting lux sensor idles at
                              its dark floor) and is flagged info/known instead of warn.
                              A stale read ABOVE the threshold is a real stall → warn.
+    offline_level: str       level of the entity_offline flag raised when this entity is
+                             unavailable, unknown or has no state for longer than the
+                             flag's threshold. Default "warn". "critical" marks life
+                             support: the probes, heater and pump the tank depends on.
+    part_of:     str         registry key of the entry this one is a reading of (a plug's
+                             power and voltage are part_of its switch). When both are
+                             dark, entity_offline raises one flag for the device.
+    offline_after_s: int     how long this entity may be dark before entity_offline
+                             flags it, in place of the flag's default (10 min). The
+                             pump uses 5 min: its outlet hasn't dropped once in 64 days,
+                             so 5 min only has to clear an HA restart.
 """
 
 from __future__ import annotations
@@ -68,6 +79,9 @@ class EntitySpec:
     gated_by: str | None = None
     powered_by: str | None = None
     stale_dark_lux: float | None = None
+    offline_level: str | None = None
+    offline_after_s: int | None = None
+    part_of: str | None = None
     notes: str | None = None
 
 
@@ -87,6 +101,7 @@ SHELF_ENTITIES: dict[str, dict[str, Any]] = {
         "target": 77.0,
         "band": 0.5,
         "flag_band": 1.0,
+        "offline_level": "critical",
         "notes": "Primary L1 control input, cross-cal reference for L2 Inkbird.",
     },
     "tank_substrate": {
@@ -98,6 +113,7 @@ SHELF_ENTITIES: dict[str, dict[str, Any]] = {
         "active": True,
         "target": 77.0,
         "flag_band": 1.5,
+        "offline_level": "critical",
         "notes": "Near-substrate probe; pairs with tank_center for stratification check.",
     },
     "shelf_ambient": {
@@ -245,6 +261,7 @@ SHELF_ENTITIES: dict[str, dict[str, Any]] = {
         "unit": None,
         "active": True,
         "target": 77.0,
+        "offline_level": "critical",
         "powered_by": "switch.cal_shelf_inkbird_10g",
     },
     "climate_bucket_rig": {
@@ -266,7 +283,9 @@ SHELF_ENTITIES: dict[str, dict[str, Any]] = {
         "role": "heater_power",
         "unit": "W",
         "active": True,
+        "part_of": "heater_switch",
         "range": (0.0, 150.0),  # normal firing window; >150 flags overdraw
+        "offline_level": "critical",
     },
     "heater_switch": {
         "entity_id": "switch.cal_shelf_inkbird_10g",
@@ -275,6 +294,7 @@ SHELF_ENTITIES: dict[str, dict[str, Any]] = {
         "role": "switch",
         "unit": None,
         "active": True,
+        "offline_level": "critical",
     },
     "heater_voltage": {
         "entity_id": "sensor.cal_shelf_inkbird_10g_voltage",
@@ -283,6 +303,7 @@ SHELF_ENTITIES: dict[str, dict[str, Any]] = {
         "role": "voltage",
         "unit": "V",
         "active": True,
+        "part_of": "heater_switch",
         "range": (115.0, 125.0),
     },
 
@@ -294,6 +315,9 @@ SHELF_ENTITIES: dict[str, dict[str, Any]] = {
         "role": "outlet_power",
         "unit": "W",
         "active": True,
+        "part_of": "outlet_1_pump_switch",
+        "offline_level": "critical",
+        "offline_after_s": 300,
         "notes": "Main tank pump — household convention: always outlet 1.",
     },
     "outlet_1_pump_switch": {
@@ -303,6 +327,8 @@ SHELF_ENTITIES: dict[str, dict[str, Any]] = {
         "role": "switch",
         "unit": None,
         "active": True,
+        "offline_level": "critical",
+        "offline_after_s": 300,
     },
     "outlet_2_bucket_power": {
         "entity_id": "sensor.calibration_shelf_strip_tapo_p316m_2_current_consumption",
