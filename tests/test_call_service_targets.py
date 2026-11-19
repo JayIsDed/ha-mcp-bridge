@@ -193,3 +193,22 @@ async def test_data_must_be_an_object(bridge) -> None:
     out = await mod.ha_call_service("switch", "turn_off", [("entity_id", "switch.allowed_lamp")])
     assert out["error"] == "invalid_data"
     assert ha.calls == []
+
+
+# Domain and service go into the request path, so they must be plain names.
+
+
+@pytest.mark.parametrize(
+    "domain,service",
+    [
+        ("fan", "x/../../switch/turn_off"),
+        ("fan", "turn_on?x=1"),
+        ("light", "turn_on/"),
+        ("Switch", "turn_off"),
+    ],
+)
+async def test_service_names_must_be_plain(bridge, domain, service) -> None:
+    mod, ha = bridge()
+    out = await mod.ha_call_service(domain, service, {"entity_id": "switch.allowed_lamp"})
+    assert out["error"] == "invalid_service"
+    assert ha.calls == []

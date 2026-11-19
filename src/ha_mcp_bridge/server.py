@@ -141,6 +141,10 @@ def _is_entity_allowed(entity_id: str) -> bool:
 # entities HA acts on, so ids are checked in a form HA reads back unchanged, and HA is
 # sent exactly the ids that were checked.
 
+# Domain and service names are lowercase words. Anything else ("/", "..", "?") goes into
+# the request path and can reach a different service than the one checked.
+_NAME_RE = re.compile(r"[a-z0-9_]+")
+
 # A plain entity id: lowercase domain and object id. Nothing HA would rewrite (case,
 # whitespace, comma lists) or read as more than one entity ("all", templates, globs).
 _ENTITY_ID_RE = re.compile(r"[a-z0-9_]+\.[a-z0-9_]+")
@@ -210,6 +214,12 @@ def _check_call(
             ),
             allowed_services_set=bool(ALLOWED_SERVICES),
             allowed_entity_patterns_set=bool(ALLOWED_ENTITY_PATTERNS),
+        )
+
+    if not all(isinstance(name, str) and _NAME_RE.fullmatch(name) for name in (domain, service)):
+        raise _Refused(
+            "invalid_service",
+            hint="domain and service must be plain names such as light and turn_on.",
         )
 
     service_id = f"{domain}.{service}"
