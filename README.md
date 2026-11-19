@@ -17,7 +17,8 @@ Tools:
 - `influx_flux(query)` — raw Flux query against the homelab InfluxDB 2.x instance.
 
 **Actuation** (narrow)
-- `ha_press_button(entity_id)` — press a `button.*` entity (ESPHome restart, etc.).
+- `ha_press_button(entity_id)` — press one `button.*` entity (ESPHome restart, etc.). Held to the
+  same allowlist: `button.press` must be an allowed service and the button an allowed entity.
 - `ha_call_service(domain, service, data)` — call any HA service that matches the env
   allowlist. Default-deny: the tool refuses unless both `HA_MCP_ALLOWED_SERVICES` and
   `HA_MCP_ALLOWED_ENTITY_PATTERNS` are set.
@@ -64,8 +65,8 @@ $EDITOR .env   # paste HA_TOKEN
 | `HA_MCP_DEBUG_LOG` | no | — | If set, bridge writes DEBUG logs to this file |
 | `HA_MCP_CAMERA_MAX_WIDTH` | no | `1024` | Default resize width (px) for `ha_camera_snapshot` |
 | `HA_MCP_CAMERA_JPEG_QUALITY` | no | `70` | Default JPEG quality for `ha_camera_snapshot` |
-| `HA_MCP_ALLOWED_SERVICES` | to enable `ha_call_service` | — | fnmatch globs on `domain.service` |
-| `HA_MCP_ALLOWED_ENTITY_PATTERNS` | to enable `ha_call_service` | — | fnmatch globs on `entity_id` |
+| `HA_MCP_ALLOWED_SERVICES` | to enable actuation | — | fnmatch globs on `domain.service` |
+| `HA_MCP_ALLOWED_ENTITY_PATTERNS` | to enable actuation | — | fnmatch globs on `entity_id` |
 
 ### Scoped `ha_call_service` — allowlist examples
 
@@ -77,11 +78,29 @@ HA_MCP_ALLOWED_ENTITY_PATTERNS=*plant_shelf*,light.grow_*,switch.grow_*,fan.grow
 ```
 
 Semantics:
-- Both lists must be non-empty — empty = tool disabled (default-deny).
-- Service must match at least one pattern in `HA_MCP_ALLOWED_SERVICES`.
-- Every `entity_id` in the call payload must match at least one pattern in `HA_MCP_ALLOWED_ENTITY_PATTERNS`.
-- Area/device-level targeting is refused — callers must pass explicit `entity_id`.
+- Both lists must be non-empty — empty = actuation disabled (default-deny).
+- `domain` and `service` must be plain names (`[a-z0-9_]+`), and the service must match at least one
+  pattern in `HA_MCP_ALLOWED_SERVICES`.
+- `data.entity_id` is required: a string or a list of strings. Comma-joined strings are split and
+  trimmed, as Home Assistant splits them, and every piece must be a plain lowercase entity id. `all`,
+  `none`, templates, wildcards and empty values are refused.
+- Every entity named must match at least one pattern in `HA_MCP_ALLOWED_ENTITY_PATTERNS`.
+- `area_id`, `device_id`, `floor_id`, `label_id` and `target` are refused, whatever else the call
+  names. Name each entity in `entity_id`.
+- Groups and scenes act on their members, so before sending, the bridge reads each target's state and
+  follows its member attributes (`entity_id`, `group_entities`), nested groups included. Every member
+  must match the entity patterns too. An entity HA doesn't know, or a failed state read, refuses
+  the call.
+- HA is sent exactly the entity ids that were checked.
 - Every denial is logged to stderr for audit.
+
+What the allowlist can't see, so keep these off `HA_MCP_ALLOWED_SERVICES` unless every entity they
+could touch is one you'd allow directly:
+- Scripts and automations (`script.*`, `automation.trigger`): an allowed script runs whatever it
+  calls.
+- Services that take entities in other data fields, such as `scene.apply`, `scene.create` and
+  `group.set`.
+- Groups and scenes that an integration manages itself, which don't list their members in state.
 
 ## Run
 
