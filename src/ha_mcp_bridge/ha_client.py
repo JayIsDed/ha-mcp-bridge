@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -46,6 +47,11 @@ class HAClient:
             raise HAError(f"Cannot reach HA at {self._base}: {e}") from e
         except aiohttp.ClientError as e:
             raise HAError(f"HTTP error talking to HA: {e}") from e
+        except asyncio.TimeoutError as e:
+            # A total timeout while reading the response is a bare TimeoutError, not
+            # a ClientError; without this it escapes HAError and callers that
+            # handle HA outages never see it.
+            raise HAError(f"Timed out talking to HA at {self._base}") from e
 
     async def _get_bytes(self, path: str, params: dict[str, str] | None = None) -> bytes:
         assert self._session is not None, "HAClient must be used as async context manager"
@@ -64,6 +70,8 @@ class HAClient:
             raise HAError(f"Cannot reach HA at {self._base}: {e}") from e
         except aiohttp.ClientError as e:
             raise HAError(f"HTTP error talking to HA: {e}") from e
+        except asyncio.TimeoutError as e:
+            raise HAError(f"Timed out talking to HA at {self._base}") from e
 
     async def _post(self, path: str, body: dict[str, Any]) -> Any:
         assert self._session is not None, "HAClient must be used as async context manager"
@@ -85,6 +93,8 @@ class HAClient:
             raise HAError(f"Cannot reach HA at {self._base}: {e}") from e
         except aiohttp.ClientError as e:
             raise HAError(f"HTTP error talking to HA: {e}") from e
+        except asyncio.TimeoutError as e:
+            raise HAError(f"Timed out talking to HA at {self._base}") from e
 
     async def list_states(self) -> list[dict[str, Any]]:
         data = await self._get("/api/states")

@@ -32,18 +32,32 @@ async def fetch_states(
     entity_ids: list[str],
 ) -> dict[str, dict[str, Any]]:
     """Fetch states for a list of entity_ids in parallel. Returns a dict keyed
-    by entity_id. Entities that error or return None are omitted.
+    by entity_id.
+
+    An entity HA doesn't know (404) or whose single read failed is left out of
+    the dict; the flag evaluators treat a missing entity as dark, so it is
+    reported, not dropped.
+
+    Raises HAError when no read succeeded at all: HA is down, hung, or rejected
+    the token. Swallowing that case left every caller with an empty snapshot,
+    which the evaluators read as "nothing wrong".
     """
 
-    async def one(eid: str) -> tuple[str, dict[str, Any] | None]:
+    async def one(eid: str) -> tuple[str, dict[str, Any] | None, HAError | None]:
         try:
             raw = await ha.get_state(eid)
-        except HAError:
-            return eid, None
-        return eid, raw
+        except HAError as e:
+            return eid, None, e
+        return eid, raw, None
 
     results = await asyncio.gather(*(one(eid) for eid in entity_ids))
-    return {eid: raw for eid, raw in results if raw is not None}
+    errors = [err for _, _, err in results if err is not None]
+    if entity_ids and len(errors) == len(entity_ids):
+        raise HAError(
+            f"Could not read any of the {len(entity_ids)} entities from HA, so there "
+            f"is no health to report. First error: {errors[0]}"
+        )
+    return {eid: raw for eid, raw, _ in results if raw is not None}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
