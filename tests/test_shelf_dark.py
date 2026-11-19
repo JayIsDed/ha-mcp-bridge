@@ -66,6 +66,16 @@ REG = {
 }
 
 
+# The same tank with each plug's readings marked as part of its switch.
+PLUGS = {
+    key: {**entry, "part_of": parent} if (parent := {
+        "heater_power": "heater_switch", "heater_voltage": "heater_switch",
+        "outlet_1_pump_power": "outlet_1_pump_switch",
+    }.get(key)) else entry
+    for key, entry in REG.items()
+}
+
+
 def st(eid: str, state: str, ago: timedelta = timedelta(0), attrs: dict | None = None) -> dict:
     ts = (NOW - ago).isoformat()
     return {"entity_id": eid, "state": state, "attributes": attrs or {},
@@ -124,12 +134,16 @@ def test_dark_heater_plug_is_critical_before_the_tank_cools() -> None:
     for eid in ("switch.heater_a", "sensor.heater_a_power", "sensor.heater_a_voltage"):
         states[eid] = st(eid, "unavailable", timedelta(hours=3))
     states["climate.tank_a"] = thermostat("idle")
-    flags = flags_by_name(states)
-    assert flags["entity_offline:heater_switch"]["level"] == "critical"
-    assert flags["entity_offline:heater_power"]["level"] == "critical"
-    assert flags["entity_offline:heater_voltage"]["level"] == "warn"
-    assert flags["entity_offline:heater_switch"]["since"] == (NOW - timedelta(hours=3)).isoformat()
-    assert "3 h" in flags["entity_offline:heater_switch"]["message"]
+    flags = flags_by_name(states, PLUGS)
+    plug = flags["entity_offline:heater_switch"]
+    assert plug["level"] == "critical"
+    assert plug["since"] == (NOW - timedelta(hours=3)).isoformat()
+    assert "3 h" in plug["message"]
+    # one dead plug is one offline flag, naming its readings
+    assert "sensor.heater_a_power" in plug["message"]
+    assert "sensor.heater_a_voltage" in plug["message"]
+    assert "entity_offline:heater_power" not in flags
+    assert "entity_offline:heater_voltage" not in flags
 
 
 def test_heater_missing_from_ha_flags_at_once() -> None:
@@ -235,7 +249,8 @@ def test_real_registry_dark_heater_plug_flags() -> None:
         states[eid] = st(eid, "unavailable", timedelta(hours=3))
     flags = flags_by_name(states, SHELF_ENTITIES)
     assert flags["entity_offline:heater_switch"]["level"] == "critical"
-    assert flags["entity_offline:heater_power"]["level"] == "critical"
+    offline = [f for f in flags if f.startswith("entity_offline:")]
+    assert offline == ["entity_offline:heater_switch"], offline
 
 
 # ─── heater: a normal cycle's tail is not a dead heater ──────────────────────
@@ -316,9 +331,10 @@ def test_pump_dark_is_critical_after_five_minutes() -> None:
     states = healthy()
     for eid in ("switch.pump_a", "sensor.pump_a_power"):
         states[eid] = st(eid, "unavailable", timedelta(minutes=6))
-    flags = flags_by_name(states)
+    flags = flags_by_name(states, PLUGS)
     assert flags["entity_offline:outlet_1_pump_switch"]["level"] == "critical"
-    assert "pump_not_running" not in flags  # one fault, reported by entity_offline
+    assert "entity_offline:outlet_1_pump_power" not in flags
+    assert "pump_not_running" not in flags  # one fault, one flag
 
 
 def test_pump_switched_on_a_moment_ago_is_not_flagged() -> None:
@@ -355,3 +371,18 @@ def test_real_registry_pump_off_and_dark() -> None:
         states[eid] = st(eid, "unavailable", timedelta(minutes=6))
     flags = flags_by_name(states, SHELF_ENTITIES)
     assert flags["entity_offline:outlet_1_pump_switch"]["level"] == "critical"
+
+
+def test_a_reading_dark_on_its_own_still_flags() -> None:
+    """Switch fine, power reading dark: that reading's own flag, not the plug's."""
+    states = healthy()
+    states["sensor.heater_a_voltage"] = st("sensor.heater_a_voltage", "unavailable", timedelta(hours=1))
+    flags = flags_by_name(states, PLUGS)
+    assert flags["entity_offline:heater_voltage"]["level"] == "warn"
+    assert "entity_offline:heater_switch" not in flags
+
+
+def test_registry_folds_plug_readings_into_the_switch() -> None:
+    assert SHELF_ENTITIES["heater_power"]["part_of"] == "heater_switch"
+    assert SHELF_ENTITIES["heater_voltage"]["part_of"] == "heater_switch"
+    assert SHELF_ENTITIES["outlet_1_pump_power"]["part_of"] == "outlet_1_pump_switch"

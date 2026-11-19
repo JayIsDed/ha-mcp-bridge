@@ -43,6 +43,9 @@ Entry schema (see `EntitySpec` below for the typed version):
                              unavailable, unknown or has no state for longer than the
                              flag's threshold. Default "warn". "critical" marks life
                              support: the probes, heater and pump the tank depends on.
+    part_of:     str         registry key of the entry this one is a reading of (a plug's
+                             power and voltage are part_of its switch). When both are
+                             dark, entity_offline raises one flag for the device.
     offline_after_s: int     how long this entity may be dark before entity_offline
                              flags it, in place of the flag's default (10 min). The
                              pump uses 5 min: its outlet never dropped in 64 days of
@@ -78,6 +81,7 @@ class EntitySpec:
     stale_dark_lux: float | None = None
     offline_level: str | None = None
     offline_after_s: int | None = None
+    part_of: str | None = None
     notes: str | None = None
 
 
@@ -279,6 +283,7 @@ SHELF_ENTITIES: dict[str, dict[str, Any]] = {
         "role": "heater_power",
         "unit": "W",
         "active": True,
+        "part_of": "heater_switch",
         "range": (0.0, 150.0),  # normal firing window; >150 flags overdraw
         "offline_level": "critical",
     },
@@ -298,6 +303,7 @@ SHELF_ENTITIES: dict[str, dict[str, Any]] = {
         "role": "voltage",
         "unit": "V",
         "active": True,
+        "part_of": "heater_switch",
         "range": (115.0, 125.0),
     },
 
@@ -309,6 +315,7 @@ SHELF_ENTITIES: dict[str, dict[str, Any]] = {
         "role": "outlet_power",
         "unit": "W",
         "active": True,
+        "part_of": "outlet_1_pump_switch",
         "offline_level": "critical",
         "offline_after_s": 300,
         "notes": "Main tank pump — household convention: always outlet 1.",

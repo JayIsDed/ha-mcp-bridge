@@ -435,6 +435,8 @@ def flag_sensor_stale(
 # the hours a cooling tank gives you.
 OFFLINE_AFTER_S = 600
 
+_LEVEL_RANK = {"info": 0, "warn": 1, "critical": 2}
+
 
 def fmt_age(secs: float) -> str:
     if secs < 7200:
@@ -459,8 +461,13 @@ def flag_entity_offline(
     as sensor_stale does.
 
     `since` is when the entity went dark (its last_changed), so the age is real.
+
+    One device, one flag: an entry whose `part_of` names another entry (a
+    plug's power and voltage readings, `part_of` its switch) is folded into
+    that entry's flag when both are dark, at the higher of the two levels. A
+    reading that goes dark on its own still flags by itself.
     """
-    flags: list[dict[str, Any]] = []
+    found: dict[str, dict[str, Any]] = {}
     for key, entry in registry.items():
         if not entry.get("active"):
             continue
@@ -474,7 +481,6 @@ def flag_entity_offline(
         if raw is not None and not _is_unavailable(raw):
             continue
 
-        level = entry.get("offline_level") or "warn"
         if raw is None:
             since = None
             detail = "has no state in HA (entity missing, or its read failed)"
@@ -485,13 +491,32 @@ def flag_entity_offline(
                 continue
             shown = raw.get("state") or "null"
             detail = f"has been {shown}" + (f" for {fmt_age(secs)}" if secs is not None else "")
-        message = f"{key} ({eid}) {detail}."
-        if level == "critical":
+        found[key] = {
+            "level": entry.get("offline_level") or "warn",
+            "since": since,
+            "detail": f"{key} ({eid}) {detail}.",
+            "also": [],
+        }
+
+    for key in list(found):
+        parent = registry[key].get("part_of")
+        if parent and parent != key and parent in found:
+            child = found.pop(key)
+            found[parent]["also"].append(f"{key} ({registry[key]['entity_id']})")
+            if _LEVEL_RANK[child["level"]] > _LEVEL_RANK[found[parent]["level"]]:
+                found[parent]["level"] = child["level"]
+
+    flags: list[dict[str, Any]] = []
+    for key, f in found.items():
+        message = f["detail"]
+        if f["also"]:
+            message += f" Same device, also dark: {', '.join(f['also'])}."
+        if f["level"] == "critical":
             message += " Life support: nothing is watching or driving this part of the tank."
         flags.append({
             "flag": f"entity_offline:{key}",
-            "level": level,
-            "since": since.isoformat() if since else None,
+            "level": f["level"],
+            "since": f["since"].isoformat() if f["since"] else None,
             "message": message,
             "known": False,
         })
