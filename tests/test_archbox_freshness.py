@@ -106,3 +106,50 @@ def test_unreadable_power_switch_is_not_reported_as_asleep() -> None:
     flags = {f["flag"]: f for f in compose_archbox(states, NOW)["flags"]}
     assert flags["power_switch_unknown"]["level"] == "warn"
     assert "archbox_offline" not in flags
+
+
+# ─── archbox_health_full with HA down keeps its InfluxDB sections ────────────
+
+
+class _Influx:
+    def __init__(self, rows):
+        self.rows = rows
+
+    async def query(self, flux):
+        return self.rows
+
+
+def _closed_url() -> str:
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return f"http://127.0.0.1:{s.getsockname()[1]}"
+
+
+async def test_full_read_keeps_influx_when_ha_is_down() -> None:
+    from test_archbox_health import _full_rows
+
+    from ha_mcp_bridge.archbox_health import build_archbox_full
+    from ha_mcp_bridge.ha_client import HAClient
+
+    async with HAClient(_closed_url(), "stand-in-token", timeout=2.0) as ha:
+        out = await build_archbox_full(ha, _Influx(_full_rows()))
+    assert out["cpu"]["tctl"] == 36.5
+    assert out["gpu_die"]["temp"] == 27.0
+    assert out["online"] is None
+    assert out["power"]["wall_w"] is None
+    flags = {f["flag"]: f for f in out["flags"]}
+    assert flags["ha_unreachable"]["level"] == "warn"
+    assert "archbox_offline" not in flags
+
+
+async def test_full_read_errors_when_ha_and_influx_have_nothing() -> None:
+    import pytest
+
+    from ha_mcp_bridge.archbox_health import build_archbox_full
+    from ha_mcp_bridge.ha_client import HAClient, HAError
+
+    async with HAClient(_closed_url(), "stand-in-token", timeout=2.0) as ha:
+        with pytest.raises(HAError):
+            await build_archbox_full(ha, _Influx([]))

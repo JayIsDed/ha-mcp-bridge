@@ -19,7 +19,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from .ha_client import HAClient
+from .ha_client import HAClient, HAError
 from .shelf_flags import fmt_age
 from .shelf_health import fetch_states
 
@@ -288,8 +288,14 @@ def compose_archbox_full(
     rows: list[dict[str, Any]],
     states: dict[str, dict[str, Any]],
     now: datetime,
+    ha_error: str | None = None,
 ) -> dict[str, Any]:
-    """Pure function: influx rows + HA states -> sectioned snapshot."""
+    """Pure function: influx rows + HA states -> sectioned snapshot.
+
+    `ha_error` set means HA could not be read: the InfluxDB sections still
+    stand, `online` is None (unknown), and an ha_unreachable flag says what is
+    missing.
+    """
     temps: dict[str, list[float]] = {}
     icx: dict[str, float] = {}
     fans_gpu: dict[str, float] = {}
@@ -350,7 +356,7 @@ def compose_archbox_full(
 
     snapshot: dict[str, Any] = {
         "timestamp": now.isoformat(),
-        "online": (states.get("switch.archbox") or {}).get("state") == "on",
+        "online": None if ha_error else (states.get("switch.archbox") or {}).get("state") == "on",
         "cpu": {
             "tctl": t("k10temp_tctl"),
             "ccd1": t("k10temp_tccd1"),
@@ -445,7 +451,12 @@ def compose_archbox_full(
         ),
     }
     flags: list[dict[str, Any]] = []
-    if not snapshot["online"]:
+    if ha_error:
+        flags.append({"flag": "ha_unreachable", "level": "warn", "known": False,
+                      "message": f"HA could not be read ({ha_error}), so wall power, the "
+                                 "plug and whether the box is switched on are unknown. "
+                                 "The InfluxDB sections are current."})
+    elif not snapshot["online"]:
         flags.append({"flag": "archbox_offline", "level": "info", "known": True,
                       "message": "archbox is powered off; telemetry is stale."})
     for key, (warn, crit) in THRESHOLDS.items():
@@ -477,15 +488,27 @@ def compose_archbox_full(
 
 
 async def build_archbox_full(ha: HAClient, influx: Any) -> dict[str, Any]:
-    """Query InfluxDB for the whole sensor suite + HA for power, then compose."""
+    """Query InfluxDB for the whole sensor suite + HA for power, then compose.
+
+    The sensor suite comes from InfluxDB alone, so HA being down costs only the
+    power block and the on/off state: the snapshot comes back with those
+    unknown and an ha_unreachable flag. Only when InfluxDB has nothing either
+    does the HA error propagate.
+    """
     rows = await influx.query(FULL_FLUX)
-    states = await fetch_states(
-        ha,
-        [
-            "switch.archbox", "switch.pc_strip",
-            "sensor.pc_strip_current_consumption", "sensor.pc_strip_voltage",
-            "sensor.pc_strip_today_s_consumption",
-            "sensor.pc_strip_this_month_s_consumption",
-        ],
-    )
-    return compose_archbox_full(rows, states, datetime.now(timezone.utc))
+    ha_error: str | None = None
+    try:
+        states: dict[str, dict[str, Any]] = await fetch_states(
+            ha,
+            [
+                "switch.archbox", "switch.pc_strip",
+                "sensor.pc_strip_current_consumption", "sensor.pc_strip_voltage",
+                "sensor.pc_strip_today_s_consumption",
+                "sensor.pc_strip_this_month_s_consumption",
+            ],
+        )
+    except HAError as e:
+        if not rows:
+            raise
+        states, ha_error = {}, str(e)
+    return compose_archbox_full(rows, states, datetime.now(timezone.utc), ha_error)
