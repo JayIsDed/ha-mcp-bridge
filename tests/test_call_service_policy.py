@@ -29,9 +29,13 @@ def server_mod(monkeypatch):
 
 @pytest.fixture
 def server_disabled(monkeypatch):
-    """Re-import with allowlists unset — tool should default-deny."""
-    monkeypatch.delenv("HA_MCP_ALLOWED_SERVICES", raising=False)
-    monkeypatch.delenv("HA_MCP_ALLOWED_ENTITY_PATTERNS", raising=False)
+    """Re-import with allowlists empty — tool should default-deny.
+
+    Set to "" rather than deleted: the reload re-reads a project .env, and python-dotenv
+    only leaves a variable alone when it is already present in the environment.
+    """
+    monkeypatch.setenv("HA_MCP_ALLOWED_SERVICES", "")
+    monkeypatch.setenv("HA_MCP_ALLOWED_ENTITY_PATTERNS", "")
     monkeypatch.setenv("HA_TOKEN", "fake-for-import")
     import ha_mcp_bridge.server as mod
 
@@ -72,8 +76,8 @@ async def test_area_targeting_blocked(server_mod) -> None:
     out = await server_mod.ha_call_service(
         "light", "turn_on", {"area_id": "plant_shelf"}
     )
-    assert out["error"] == "entity_required"
-    assert "Area/device" in out["hint"]
+    assert out["error"] == "target_not_allowed"
+    assert out["keys"] == ["area_id"]
 
 
 async def test_list_entity_partial_denied(server_mod) -> None:
@@ -96,6 +100,9 @@ async def test_wildcard_service_matches(server_mod, monkeypatch) -> None:
 
         async def __aexit__(self, *_):
             return None
+
+        async def get_state(self, entity_id):
+            return {"entity_id": entity_id, "state": "off", "attributes": {}}
 
         async def call_service(self, domain, service, data):
             called["args"] = (domain, service, data)
@@ -121,6 +128,9 @@ async def test_wildcard_entity_matches(server_mod, monkeypatch) -> None:
 
         async def __aexit__(self, *_):
             return None
+
+        async def get_state(self, entity_id):
+            return {"entity_id": entity_id, "state": "off", "attributes": {}}
 
         async def call_service(self, domain, service, data):
             called["ok"] = True

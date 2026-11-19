@@ -4,6 +4,7 @@ import fnmatch
 import json
 import logging
 import os
+import re
 import sys
 from io import BytesIO
 from pathlib import Path
@@ -134,6 +135,193 @@ def _is_service_allowed(service_id: str) -> bool:
 
 def _is_entity_allowed(entity_id: str) -> bool:
     return any(fnmatch.fnmatchcase(entity_id, p) for p in ALLOWED_ENTITY_PATTERNS)
+
+
+# Service-call target policy. The allowlist holds only if the entities it checks are the
+# entities HA acts on, so ids are checked in a form HA reads back unchanged, and HA is
+# sent exactly the ids that were checked.
+
+# Domain and service names are lowercase words. Anything else ("/", "..", "?") goes into
+# the request path and can reach a different service than the one checked.
+_NAME_RE = re.compile(r"[a-z0-9_]+")
+
+# A plain entity id: lowercase domain and object id. Nothing HA would rewrite (case,
+# whitespace, comma lists) or read as more than one entity ("all", templates, globs).
+_ENTITY_ID_RE = re.compile(r"[a-z0-9_]+\.[a-z0-9_]+")
+
+# Service-data keys that select entities indirectly. HA resolves each to entities the
+# allowlist never sees, so any of them refuses the call, whatever else is named.
+# "target" is the wrapper other HA APIs use for the same keys.
+_INDIRECT_TARGET_KEYS = ("area_id", "device_id", "floor_id", "label_id", "target")
+
+# State attributes through which one entity acts on others. HA expands groups into
+# their members ("entity_id" on old-style and group-platform groups, "group_entities"
+# on group entities) and a scene sets every entity it lists under "entity_id".
+_MEMBER_ATTRS = ("entity_id", "group_entities")
+
+
+class _Refused(Exception):
+    """A service call the policy will not forward. Carries the tool's error payload."""
+
+    def __init__(self, error: str, **detail: Any) -> None:
+        super().__init__(error)
+        self.payload: dict[str, Any] = {"error": error, **detail}
+
+
+def _plain_entity_ids(raw: Any) -> list[str]:
+    """Split entity_id the way HA does (commas, then trim) and require plain ids."""
+    if isinstance(raw, str):
+        items = [raw]
+    elif isinstance(raw, list) and all(isinstance(item, str) for item in raw):
+        items = raw
+    elif raw is None:
+        items = []
+    else:
+        raise _Refused(
+            "invalid_entity_id", hint="entity_id must be a string or a list of strings."
+        )
+
+    pieces = [piece.strip() for item in items for piece in item.split(",")]
+    if not any(pieces):
+        raise _Refused(
+            "entity_required", hint="data must name at least one entity in entity_id."
+        )
+
+    ids: list[str] = []
+    for eid in pieces:
+        if not _ENTITY_ID_RE.fullmatch(eid):
+            raise _Refused(
+                "invalid_entity_id",
+                entity_id=eid,
+                hint=(
+                    "Use plain entity ids such as light.kitchen: lowercase, "
+                    "no templates or wildcards, no all/none."
+                ),
+            )
+        if eid not in ids:
+            ids.append(eid)
+    return ids
+
+
+def _check_call(
+    domain: str, service: str, data: Any
+) -> tuple[str, list[str], dict[str, Any]]:
+    """Apply the allowlist to a service call without touching HA.
+
+    Returns (service_id, entity_ids, payload to send) or raises _Refused.
+    """
+    if not ALLOWED_SERVICES or not ALLOWED_ENTITY_PATTERNS:
+        raise _Refused(
+            "ha_call_service disabled",
+            hint=(
+                "Set both HA_MCP_ALLOWED_SERVICES and HA_MCP_ALLOWED_ENTITY_PATTERNS "
+                "in env to enable. Both accept comma-separated fnmatch glob patterns."
+            ),
+            allowed_services_set=bool(ALLOWED_SERVICES),
+            allowed_entity_patterns_set=bool(ALLOWED_ENTITY_PATTERNS),
+        )
+
+    if not all(isinstance(name, str) and _NAME_RE.fullmatch(name) for name in (domain, service)):
+        raise _Refused(
+            "invalid_service",
+            hint="domain and service must be plain names such as light and turn_on.",
+        )
+
+    service_id = f"{domain}.{service}"
+    if not _is_service_allowed(service_id):
+        raise _Refused(
+            "service_not_allowed", service=service_id, allowed_services=ALLOWED_SERVICES
+        )
+
+    if data is not None and not isinstance(data, dict):
+        raise _Refused("invalid_data", hint="data must be an object.")
+    payload = dict(data or {})
+
+    indirect = [key for key in _INDIRECT_TARGET_KEYS if key in payload]
+    if indirect:
+        raise _Refused(
+            "target_not_allowed",
+            keys=indirect,
+            hint=(
+                "Area, device, floor, label and target selectors are not permitted. "
+                "Name each entity in entity_id."
+            ),
+        )
+
+    entity_ids = _plain_entity_ids(payload.get("entity_id"))
+    for eid in entity_ids:
+        if not _is_entity_allowed(eid):
+            raise _Refused(
+                "entity_not_allowed",
+                entity_id=eid,
+                service=service_id,
+                allowed_entity_patterns=ALLOWED_ENTITY_PATTERNS,
+            )
+
+    # Send what was checked, never the caller's raw value. One id goes as a string so
+    # services whose schema takes a single entity keep working.
+    payload["entity_id"] = entity_ids[0] if len(entity_ids) == 1 else entity_ids
+    return service_id, entity_ids, payload
+
+
+async def _check_members(ha: HAClient, entity_ids: list[str], service_id: str) -> None:
+    """Hold every group or scene member the call would reach to the allowlist.
+
+    Reads each named entity's state and follows its member attributes, nested groups
+    included. Fails closed: an entity HA doesn't know, or a state read that fails,
+    refuses the call.
+    """
+    seen = set(entity_ids)
+    queue = list(entity_ids)
+    while queue:
+        eid = queue.pop()
+        try:
+            current = await ha.get_state(eid)
+        except HAError as e:
+            raise _Refused("entity_check_failed", entity_id=eid, detail=str(e)) from e
+        if current is None:
+            raise _Refused("entity_not_found", entity_id=eid, service=service_id)
+
+        attributes = current.get("attributes") or {}
+        for attr in _MEMBER_ATTRS:
+            members = attributes.get(attr)
+            if members is None:
+                continue
+            for member in members if isinstance(members, list) else [members]:
+                if not (
+                    isinstance(member, str)
+                    and _ENTITY_ID_RE.fullmatch(member)
+                    and _is_entity_allowed(member)
+                ):
+                    raise _Refused(
+                        "entity_not_allowed",
+                        entity_id=member,
+                        via=eid,
+                        service=service_id,
+                        allowed_entity_patterns=ALLOWED_ENTITY_PATTERNS,
+                    )
+                if member not in seen:
+                    seen.add(member)
+                    queue.append(member)
+
+
+async def _gated_call(domain: str, service: str, data: Any) -> dict[str, Any]:
+    """Run a service call through the allowlist, then send it to HA."""
+    try:
+        service_id, entity_ids, payload = _check_call(domain, service, data)
+        async with _client() as ha:
+            await _check_members(ha, entity_ids, service_id)
+            try:
+                result = await ha.call_service(domain, service, payload)
+            except HAError as e:
+                return {"error": str(e), "service": service_id, "entity_ids": entity_ids}
+    except _Refused as refused:
+        detail = {k: v for k, v in refused.payload.items() if not k.startswith("allowed_")}
+        log.warning("ha_call_service DENIED %r.%r: %s", domain, service, detail)
+        return refused.payload
+
+    log.info("ha_call_service OK: %s on %s", service_id, entity_ids)
+    return {"ok": True, "service": service_id, "entity_ids": entity_ids, "result": result}
 
 
 @mcp.tool()
@@ -435,26 +623,32 @@ async def ha_logbook(hours: int = 1, entity_id: str | None = None) -> list[dict]
 async def ha_press_button(entity_id: str) -> dict:
     """Press a Home Assistant button entity (e.g. ESPHome restart buttons).
 
-    Narrow-scope actuation. Only acts on button-domain entities; for anything broader
-    you'd want a full service-call tool (not exposed here by design).
+    Narrow-scope actuation, held to the same allowlists as ha_call_service: the
+    button.press service must be in HA_MCP_ALLOWED_SERVICES and the button must match
+    HA_MCP_ALLOWED_ENTITY_PATTERNS.
 
     Args:
-        entity_id: Fully-qualified button entity, e.g. "button.plant_shelf_temperatures_restart".
+        entity_id: One fully-qualified button entity, e.g. "button.workshop_sensor_restart".
 
     Returns:
         {ok: true, entity_id, result} on success, {error: ...} on failure.
         HA's response body is included under "result" for inspection.
     """
-    if not entity_id.startswith("button."):
-        return {"error": f"ha_press_button only operates on button.* entities, got: {entity_id}"}
+    if not (
+        isinstance(entity_id, str)
+        and entity_id.startswith("button.")
+        and _ENTITY_ID_RE.fullmatch(entity_id)
+    ):
+        return {
+            "error": "invalid_entity_id",
+            "entity_id": entity_id,
+            "hint": "ha_press_button takes one plain button.* entity id.",
+        }
 
-    async with _client() as ha:
-        try:
-            result = await ha.call_service("button", "press", {"entity_id": entity_id})
-        except HAError as e:
-            return {"error": str(e)}
-
-    return {"ok": True, "entity_id": entity_id, "result": result}
+    out = await _gated_call("button", "press", {"entity_id": entity_id})
+    if not out.get("ok"):
+        return out
+    return {"ok": True, "entity_id": entity_id, "result": out["result"]}
 
 
 @mcp.tool()
@@ -467,8 +661,11 @@ async def ha_call_service(domain: str, service: str, data: dict | None = None) -
       HA_MCP_ALLOWED_ENTITY_PATTERNS   e.g. "*plant_shelf*,light.grow_*"  (or "*" to allow any)
 
     Both gates are evaluated: the service id `{domain}.{service}` must match at least one
-    service pattern, AND every entity_id in `data` must match at least one entity pattern.
-    Area/device-level targeting is not permitted — call with explicit entity_id(s).
+    service pattern, AND every entity the call names must match at least one entity
+    pattern. A comma-joined entity_id string is split and each id checked, as HA would
+    split it. Area, device, floor, label and target selectors are refused, as are
+    "all", "none", templates and anything that is not a plain entity id. HA is sent
+    exactly the ids that were checked.
 
     Denials are logged to stderr so the operator can audit attempted out-of-scope calls.
 
@@ -481,62 +678,10 @@ async def ha_call_service(domain: str, service: str, data: dict | None = None) -
     Returns:
         {ok: true, service, entity_ids, result} on success.
         {error: "ha_call_service disabled" | "service_not_allowed" | "entity_not_allowed"
-         | "entity_required" | <HA error>, ...diagnostic fields} on failure.
+         | "entity_required" | "invalid_entity_id" | "target_not_allowed" | "invalid_data"
+         | <HA error>, ...diagnostic fields} on failure.
     """
-    if not ALLOWED_SERVICES or not ALLOWED_ENTITY_PATTERNS:
-        return {
-            "error": "ha_call_service disabled",
-            "hint": (
-                "Set both HA_MCP_ALLOWED_SERVICES and HA_MCP_ALLOWED_ENTITY_PATTERNS "
-                "in env to enable. Both accept comma-separated fnmatch glob patterns."
-            ),
-            "allowed_services_set": bool(ALLOWED_SERVICES),
-            "allowed_entity_patterns_set": bool(ALLOWED_ENTITY_PATTERNS),
-        }
-
-    service_id = f"{domain}.{service}"
-    if not _is_service_allowed(service_id):
-        log.warning("ha_call_service DENIED service: %s", service_id)
-        return {
-            "error": "service_not_allowed",
-            "service": service_id,
-            "allowed_services": ALLOWED_SERVICES,
-        }
-
-    payload = dict(data or {})
-    raw_entity = payload.get("entity_id")
-    if raw_entity is None:
-        if "area_id" in payload or "device_id" in payload:
-            return {
-                "error": "entity_required",
-                "hint": "Area/device-level targeting is not permitted. Call with explicit entity_id.",
-            }
-        return {
-            "error": "entity_required",
-            "hint": "data must include entity_id (string or list of strings).",
-        }
-
-    entity_ids = [raw_entity] if isinstance(raw_entity, str) else list(raw_entity)
-    for eid in entity_ids:
-        if not _is_entity_allowed(eid):
-            log.warning(
-                "ha_call_service DENIED entity: %s (service %s)", eid, service_id
-            )
-            return {
-                "error": "entity_not_allowed",
-                "entity_id": eid,
-                "service": service_id,
-                "allowed_entity_patterns": ALLOWED_ENTITY_PATTERNS,
-            }
-
-    async with _client() as ha:
-        try:
-            result = await ha.call_service(domain, service, payload)
-        except HAError as e:
-            return {"error": str(e), "service": service_id, "entity_ids": entity_ids}
-
-    log.info("ha_call_service OK: %s on %s", service_id, entity_ids)
-    return {"ok": True, "service": service_id, "entity_ids": entity_ids, "result": result}
+    return await _gated_call(domain, service, data)
 
 
 @mcp.tool()
