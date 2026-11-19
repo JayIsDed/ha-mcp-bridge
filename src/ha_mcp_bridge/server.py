@@ -154,6 +154,11 @@ _ENTITY_ID_RE = re.compile(r"[a-z0-9_]+\.[a-z0-9_]+")
 # "target" is the wrapper other HA APIs use for the same keys.
 _INDIRECT_TARGET_KEYS = ("area_id", "device_id", "floor_id", "label_id", "target")
 
+# State attributes through which one entity acts on others. HA expands groups into
+# their members ("entity_id" on old-style and group-platform groups, "group_entities"
+# on group entities) and a scene sets every entity it lists under "entity_id".
+_MEMBER_ATTRS = ("entity_id", "group_entities")
+
 
 class _Refused(Exception):
     """A service call the policy will not forward. Carries the tool's error payload."""
@@ -259,20 +264,61 @@ def _check_call(
     return service_id, entity_ids, payload
 
 
+async def _check_members(ha: HAClient, entity_ids: list[str], service_id: str) -> None:
+    """Hold every group or scene member the call would reach to the allowlist.
+
+    Reads each named entity's state and follows its member attributes, nested groups
+    included. Fails closed: an entity HA doesn't know, or a state read that fails,
+    refuses the call.
+    """
+    seen = set(entity_ids)
+    queue = list(entity_ids)
+    while queue:
+        eid = queue.pop()
+        try:
+            current = await ha.get_state(eid)
+        except HAError as e:
+            raise _Refused("entity_check_failed", entity_id=eid, detail=str(e)) from e
+        if current is None:
+            raise _Refused("entity_not_found", entity_id=eid, service=service_id)
+
+        attributes = current.get("attributes") or {}
+        for attr in _MEMBER_ATTRS:
+            members = attributes.get(attr)
+            if members is None:
+                continue
+            for member in members if isinstance(members, list) else [members]:
+                if not (
+                    isinstance(member, str)
+                    and _ENTITY_ID_RE.fullmatch(member)
+                    and _is_entity_allowed(member)
+                ):
+                    raise _Refused(
+                        "entity_not_allowed",
+                        entity_id=member,
+                        via=eid,
+                        service=service_id,
+                        allowed_entity_patterns=ALLOWED_ENTITY_PATTERNS,
+                    )
+                if member not in seen:
+                    seen.add(member)
+                    queue.append(member)
+
+
 async def _gated_call(domain: str, service: str, data: Any) -> dict[str, Any]:
     """Run a service call through the allowlist, then send it to HA."""
     try:
         service_id, entity_ids, payload = _check_call(domain, service, data)
+        async with _client() as ha:
+            await _check_members(ha, entity_ids, service_id)
+            try:
+                result = await ha.call_service(domain, service, payload)
+            except HAError as e:
+                return {"error": str(e), "service": service_id, "entity_ids": entity_ids}
     except _Refused as refused:
         detail = {k: v for k, v in refused.payload.items() if not k.startswith("allowed_")}
         log.warning("ha_call_service DENIED %r.%r: %s", domain, service, detail)
         return refused.payload
-
-    async with _client() as ha:
-        try:
-            result = await ha.call_service(domain, service, payload)
-        except HAError as e:
-            return {"error": str(e), "service": service_id, "entity_ids": entity_ids}
 
     log.info("ha_call_service OK: %s on %s", service_id, entity_ids)
     return {"ok": True, "service": service_id, "entity_ids": entity_ids, "result": result}

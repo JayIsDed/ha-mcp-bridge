@@ -22,7 +22,7 @@ ENTITIES = (
 INDIRECT_KEYS = ["area_id", "device_id", "floor_id", "label_id"]
 
 
-def state(entity_id: str, **attributes) -> dict:
+def state(entity_id: str, /, **attributes) -> dict:
     return {"entity_id": entity_id, "state": "on", "attributes": attributes}
 
 
@@ -211,4 +211,105 @@ async def test_service_names_must_be_plain(bridge, domain, service) -> None:
     mod, ha = bridge()
     out = await mod.ha_call_service(domain, service, {"entity_id": "switch.allowed_lamp"})
     assert out["error"] == "invalid_service"
+    assert ha.calls == []
+
+
+# Groups and scenes act on their members, so the members are held to the allowlist.
+
+
+async def test_group_with_forbidden_member_is_refused(bridge) -> None:
+    ha = FakeHA(
+        {
+            "group.allowed_set": state(
+                "group.allowed_set", entity_id=["switch.allowed_lamp", "switch.forbidden_relay"]
+            )
+        }
+    )
+    mod, ha = bridge(ha=ha)
+    out = await mod.ha_call_service("homeassistant", "turn_off", {"entity_id": "group.allowed_set"})
+    assert out["error"] == "entity_not_allowed"
+    assert out["entity_id"] == "switch.forbidden_relay"
+    assert out["via"] == "group.allowed_set"
+    assert ha.calls == []
+
+
+async def test_group_entity_with_forbidden_member_is_refused(bridge) -> None:
+    # A group entity (e.g. a switch group) lists its members under group_entities.
+    ha = FakeHA(
+        {
+            "switch.allowed_bank": state(
+                "switch.allowed_bank",
+                group_entities=["switch.allowed_lamp", "switch.forbidden_relay"],
+            )
+        }
+    )
+    mod, ha = bridge(ha=ha)
+    out = await mod.ha_call_service("switch", "turn_off", {"entity_id": "switch.allowed_bank"})
+    assert out["error"] == "entity_not_allowed"
+    assert out["entity_id"] == "switch.forbidden_relay"
+    assert ha.calls == []
+
+
+async def test_nested_group_member_is_refused(bridge) -> None:
+    ha = FakeHA(
+        {
+            "group.allowed_outer": state("group.allowed_outer", entity_id=["group.allowed_inner"]),
+            "group.allowed_inner": state("group.allowed_inner", entity_id=["switch.forbidden_relay"]),
+        }
+    )
+    mod, ha = bridge(ha=ha)
+    out = await mod.ha_call_service(
+        "homeassistant", "turn_off", {"entity_id": "group.allowed_outer"}
+    )
+    assert out["error"] == "entity_not_allowed"
+    assert out["entity_id"] == "switch.forbidden_relay"
+    assert out["via"] == "group.allowed_inner"
+    assert ha.calls == []
+
+
+async def test_scene_setting_forbidden_entity_is_refused(bridge) -> None:
+    ha = FakeHA(
+        {
+            "scene.allowed_evening": state(
+                "scene.allowed_evening", entity_id=["light.allowed_desk", "switch.forbidden_relay"]
+            )
+        }
+    )
+    mod, ha = bridge(ha=ha)
+    out = await mod.ha_call_service("scene", "turn_on", {"entity_id": "scene.allowed_evening"})
+    assert out["error"] == "entity_not_allowed"
+    assert out["entity_id"] == "switch.forbidden_relay"
+    assert ha.calls == []
+
+
+async def test_group_of_allowed_members_goes_through(bridge) -> None:
+    # Members that loop back (a group listing itself, two groups listing each other)
+    # are walked once.
+    ha = FakeHA(
+        {
+            "group.allowed_a": state(
+                "group.allowed_a", entity_id=["group.allowed_a", "group.allowed_b"]
+            ),
+            "group.allowed_b": state(
+                "group.allowed_b", entity_id=["group.allowed_a", "switch.allowed_lamp"]
+            ),
+        }
+    )
+    mod, ha = bridge(ha=ha)
+    out = await mod.ha_call_service("homeassistant", "turn_off", {"entity_id": "group.allowed_a"})
+    assert out["ok"] is True
+    assert ha.calls == [("homeassistant", "turn_off", {"entity_id": "group.allowed_a"})]
+
+
+async def test_unknown_entity_is_refused(bridge) -> None:
+    mod, ha = bridge(ha=FakeHA(missing={"switch.allowed_ghost"}))
+    out = await mod.ha_call_service("switch", "turn_on", {"entity_id": "switch.allowed_ghost"})
+    assert out["error"] == "entity_not_found"
+    assert ha.calls == []
+
+
+async def test_state_read_failure_refuses(bridge) -> None:
+    mod, ha = bridge(ha=FakeHA(fail_reads=True))
+    out = await mod.ha_call_service("switch", "turn_on", {"entity_id": "switch.allowed_lamp"})
+    assert out["error"] == "entity_check_failed"
     assert ha.calls == []

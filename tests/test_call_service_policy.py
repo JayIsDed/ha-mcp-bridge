@@ -101,6 +101,9 @@ async def test_wildcard_service_matches(server_mod, monkeypatch) -> None:
         async def __aexit__(self, *_):
             return None
 
+        async def get_state(self, entity_id):
+            return {"entity_id": entity_id, "state": "off", "attributes": {}}
+
         async def call_service(self, domain, service, data):
             called["args"] = (domain, service, data)
             return [{"entity_id": data["entity_id"], "state": "off"}]
@@ -125,6 +128,9 @@ async def test_wildcard_entity_matches(server_mod, monkeypatch) -> None:
 
         async def __aexit__(self, *_):
             return None
+
+        async def get_state(self, entity_id):
+            return {"entity_id": entity_id, "state": "off", "attributes": {}}
 
         async def call_service(self, domain, service, data):
             called["ok"] = True
