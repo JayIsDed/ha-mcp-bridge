@@ -386,3 +386,26 @@ def test_registry_folds_plug_readings_into_the_switch() -> None:
     assert SHELF_ENTITIES["heater_power"]["part_of"] == "heater_switch"
     assert SHELF_ENTITIES["heater_voltage"]["part_of"] == "heater_switch"
     assert SHELF_ENTITIES["outlet_1_pump_power"]["part_of"] == "outlet_1_pump_switch"
+
+
+# ─── sensor_stale: a steady reading is not a stalled one ─────────────────────
+
+
+def test_steady_probe_still_reporting_is_not_stale() -> None:
+    """Same value for 2 h, but HA heard it 30 s ago (last_reported)."""
+    states = healthy()
+    raw = st("sensor.tank_a_temp", "76.9", timedelta(hours=2))
+    raw["last_reported"] = (NOW - timedelta(seconds=30)).isoformat()
+    states["sensor.tank_a_temp"] = raw
+    assert not any(f.startswith("sensor_stale") for f in flags_by_name(states))
+
+
+def test_probe_that_stopped_reporting_is_stale() -> None:
+    """Control: nothing heard for 2 h."""
+    states = healthy()
+    raw = st("sensor.tank_a_temp", "76.9", timedelta(hours=2))
+    raw["last_reported"] = raw["last_changed"]
+    states["sensor.tank_a_temp"] = raw
+    flag = flags_by_name(states)["sensor_stale:tank_center"]
+    assert flag["level"] == "warn"
+    assert flag["since"] == (NOW - timedelta(hours=2)).isoformat()

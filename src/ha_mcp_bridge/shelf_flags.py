@@ -77,6 +77,22 @@ def _last_changed(raw: dict[str, Any] | None) -> datetime | None:
         return None
 
 
+def _last_heard(raw: dict[str, Any] | None) -> datetime | None:
+    """When HA last heard from the entity: last_reported, which HA stamps on
+    every report even when the value is unchanged, else last_updated or
+    last_changed. A steady reading keeps an old last_changed; only a silent one
+    keeps an old last_reported."""
+    if not raw:
+        return None
+    ts = raw.get("last_reported") or raw.get("last_updated") or raw.get("last_changed")
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def _hvac_action(raw: dict[str, Any] | None) -> str | None:
     """Extract the hvac_action attr from a climate entity's state dict."""
     if not raw:
@@ -356,7 +372,10 @@ def flag_sensor_stale(
     registry: dict[str, dict[str, Any]],
     now: datetime,
 ) -> list[dict[str, Any]]:
-    """Any active analog sensor whose last update is >30min old.
+    """Any active analog sensor HA has not heard from in >30 min.
+
+    Keys on last_reported, not last_changed: a probe in a tank holding steady
+    can report the same quantized value for an hour, which is not a stall.
 
     Only checks roles in `_CADENCE_ROLES` — analog sensors that should update
     regularly because the underlying physical value drifts continuously. Event-
@@ -388,7 +407,7 @@ def flag_sensor_stale(
         if raw is None or _is_unavailable(raw):
             continue  # flag_entity_offline / flag_canopy_offline report these; this one is staleness-while-available
 
-        lc = _last_changed(raw)
+        lc = _last_heard(raw)
         secs = _seconds_since(lc, now)
         if secs is None or secs <= STALE_SECONDS:
             continue
@@ -420,7 +439,7 @@ def flag_sensor_stale(
             "level": "warn",
             "since": lc.isoformat() if lc else None,
             "message": (
-                f"{key} ({entry['entity_id']}) has not updated in "
+                f"{key} ({entry['entity_id']}) has not reported in "
                 f"{secs / 60:.0f} min; expected within 30 min."
             ),
             "known": False,
