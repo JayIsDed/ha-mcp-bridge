@@ -623,26 +623,32 @@ async def ha_logbook(hours: int = 1, entity_id: str | None = None) -> list[dict]
 async def ha_press_button(entity_id: str) -> dict:
     """Press a Home Assistant button entity (e.g. ESPHome restart buttons).
 
-    Narrow-scope actuation. Only acts on button-domain entities; for anything broader
-    you'd want a full service-call tool (not exposed here by design).
+    Narrow-scope actuation, held to the same allowlists as ha_call_service: the
+    button.press service must be in HA_MCP_ALLOWED_SERVICES and the button must match
+    HA_MCP_ALLOWED_ENTITY_PATTERNS.
 
     Args:
-        entity_id: Fully-qualified button entity, e.g. "button.plant_shelf_temperatures_restart".
+        entity_id: One fully-qualified button entity, e.g. "button.workshop_sensor_restart".
 
     Returns:
         {ok: true, entity_id, result} on success, {error: ...} on failure.
         HA's response body is included under "result" for inspection.
     """
-    if not entity_id.startswith("button."):
-        return {"error": f"ha_press_button only operates on button.* entities, got: {entity_id}"}
+    if not (
+        isinstance(entity_id, str)
+        and entity_id.startswith("button.")
+        and _ENTITY_ID_RE.fullmatch(entity_id)
+    ):
+        return {
+            "error": "invalid_entity_id",
+            "entity_id": entity_id,
+            "hint": "ha_press_button takes one plain button.* entity id.",
+        }
 
-    async with _client() as ha:
-        try:
-            result = await ha.call_service("button", "press", {"entity_id": entity_id})
-        except HAError as e:
-            return {"error": str(e)}
-
-    return {"ok": True, "entity_id": entity_id, "result": result}
+    out = await _gated_call("button", "press", {"entity_id": entity_id})
+    if not out.get("ok"):
+        return out
+    return {"ok": True, "entity_id": entity_id, "result": out["result"]}
 
 
 @mcp.tool()

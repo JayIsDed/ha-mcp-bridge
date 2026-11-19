@@ -313,3 +313,45 @@ async def test_state_read_failure_refuses(bridge) -> None:
     out = await mod.ha_call_service("switch", "turn_on", {"entity_id": "switch.allowed_lamp"})
     assert out["error"] == "entity_check_failed"
     assert ha.calls == []
+
+
+# ha_press_button goes through the same allowlist.
+
+
+async def test_press_button_outside_allowlist_is_refused(bridge) -> None:
+    mod, ha = bridge()
+    out = await mod.ha_press_button("button.forbidden_reset")
+    assert out["error"] == "entity_not_allowed"
+    assert ha.calls == []
+
+
+@pytest.mark.parametrize(
+    "raw", ["button.allowed_restart,button.forbidden_reset", "switch.allowed_lamp", "all"]
+)
+async def test_press_button_takes_one_plain_button(bridge, raw) -> None:
+    mod, ha = bridge(entities="*")
+    out = await mod.ha_press_button(raw)
+    assert out["error"] == "invalid_entity_id"
+    assert ha.calls == []
+
+
+async def test_press_button_needs_button_press_allowed(bridge) -> None:
+    mod, ha = bridge(services="switch.turn_on")
+    out = await mod.ha_press_button("button.allowed_restart")
+    assert out["error"] == "service_not_allowed"
+    assert ha.calls == []
+
+
+async def test_press_button_disabled_without_allowlists(bridge) -> None:
+    mod, ha = bridge(services="", entities="")
+    out = await mod.ha_press_button("button.allowed_restart")
+    assert out["error"] == "ha_call_service disabled"
+    assert ha.calls == []
+
+
+async def test_press_button_allowed_goes_through(bridge) -> None:
+    mod, ha = bridge()
+    out = await mod.ha_press_button("button.allowed_restart")
+    assert out["ok"] is True
+    assert out["entity_id"] == "button.allowed_restart"
+    assert ha.calls == [("button", "press", {"entity_id": "button.allowed_restart"})]
