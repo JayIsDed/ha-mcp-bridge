@@ -80,3 +80,59 @@ async def test_healthy_ha_stays_clear(server, monkeypatch, stand_in_ha) -> None:
     assert "error" not in box
     assert box["online"] is True
     assert box["summary"] == {"critical": 0, "warn": 0, "info": 0}, box["flags"]
+
+
+def _flaky(states: dict[str, dict], eid: str, failures: int):
+    """A stand-in HA that answers 500 for `eid` the first `failures` times."""
+    left = {"n": failures}
+
+    async def handler(request: web.Request) -> web.StreamResponse:
+        name = request.match_info["entity_id"]
+        if name == eid and left["n"] > 0:
+            left["n"] -= 1
+            return web.json_response({"message": "Internal error"}, status=500)
+        raw = states.get(name)
+        if raw is None:
+            return web.json_response({"message": "Entity not found."}, status=404)
+        return web.json_response(raw)
+
+    return handler
+
+
+async def test_one_failed_read_is_retried(server, monkeypatch, stand_in_ha) -> None:
+    from ha_mcp_bridge.shelf_registry import SHELF_ENTITIES
+
+    now = datetime.now(timezone.utc)
+    states = healthy_shelf_states(now)
+    eid = SHELF_ENTITIES["tank_center"]["entity_id"]
+    monkeypatch.setattr(server, "HA_URL", await stand_in_ha(_flaky(states, eid, 1)))
+    out = await server.shelf_pulse()
+    assert out["summary"] == {"critical": 0, "warn": 0, "info": 0}, out["flags"]
+    assert out["vitals"]["tank_center"] == 77.0
+
+
+async def test_a_read_that_keeps_failing_says_so(server, monkeypatch, stand_in_ha) -> None:
+    from ha_mcp_bridge.shelf_registry import SHELF_ENTITIES
+
+    now = datetime.now(timezone.utc)
+    states = healthy_shelf_states(now)
+    eid = SHELF_ENTITIES["tank_center"]["entity_id"]
+    monkeypatch.setattr(server, "HA_URL", await stand_in_ha(_flaky(states, eid, 99)))
+    out = await server.shelf_pulse()
+    flag = {f["flag"]: f for f in out["flags"]}["entity_offline:tank_center"]
+    assert flag["level"] == "warn"
+    assert "could not be read" in flag["message"] and "500" in flag["message"]
+
+
+async def test_entity_missing_from_ha_flags_at_its_level(server, monkeypatch, stand_in_ha) -> None:
+    """Control: a real 404 is still flagged at once, at the entry's level."""
+    from ha_mcp_bridge.shelf_registry import SHELF_ENTITIES
+
+    now = datetime.now(timezone.utc)
+    states = healthy_shelf_states(now)
+    del states[SHELF_ENTITIES["tank_center"]["entity_id"]]
+    monkeypatch.setattr(server, "HA_URL", await stand_in_ha(states_handler(states)))
+    out = await server.shelf_pulse()
+    flag = {f["flag"]: f for f in out["flags"]}["entity_offline:tank_center"]
+    assert flag["level"] == "critical"
+    assert "entity missing" in flag["message"]

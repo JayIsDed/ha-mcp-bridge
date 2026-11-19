@@ -471,7 +471,9 @@ def flag_entity_offline(
     now: datetime,
 ) -> list[dict[str, Any]]:
     """Any active entity that is unavailable, unknown or null for longer than
-    OFFLINE_AFTER_S, or that HA returned no state for at all.
+    OFFLINE_AFTER_S, or that HA returned no state for at all. An entity whose
+    read failed (listed in the snapshot's `read_errors`) is flagged at warn
+    with the error, since its state is unknown rather than known dark.
 
     Level comes from the entry's `offline_level` (default warn); the probes,
     heater and pump the tank depends on are critical. An entry's
@@ -486,6 +488,7 @@ def flag_entity_offline(
     that entry's flag when both are dark, at the higher of the two levels. A
     reading that goes dark on its own still flags by itself.
     """
+    read_errors: dict[str, str] = getattr(states, "read_errors", {})
     found: dict[str, dict[str, Any]] = {}
     for key, entry in registry.items():
         if not entry.get("active"):
@@ -500,9 +503,15 @@ def flag_entity_offline(
         if raw is not None and not _is_unavailable(raw):
             continue
 
-        if raw is None:
+        level = entry.get("offline_level") or "warn"
+        if raw is None and eid in read_errors:
+            # The bridge is blind to it, which is not the same as it being dark.
             since = None
-            detail = "has no state in HA (entity missing, or its read failed)"
+            level = "warn"
+            detail = f"could not be read from HA ({read_errors[eid]}), so its state is unknown"
+        elif raw is None:
+            since = None
+            detail = "has no state in HA (entity missing)"
         else:
             since = _last_changed(raw)
             secs = _seconds_since(since, now)
@@ -511,7 +520,7 @@ def flag_entity_offline(
             shown = raw.get("state") or "null"
             detail = f"has been {shown}" + (f" for {fmt_age(secs)}" if secs is not None else "")
         found[key] = {
-            "level": entry.get("offline_level") or "warn",
+            "level": level,
             "since": since,
             "detail": f"{key} ({eid}) {detail}.",
             "also": [],

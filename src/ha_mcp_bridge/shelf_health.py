@@ -27,16 +27,30 @@ from .shelf_registry import SHELF_ENTITIES, active_entity_ids
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+class States(dict):
+    """Entity states keyed by entity_id, plus `read_errors`: the entity_ids
+    whose read failed (after one retry), each with its error."""
+
+    read_errors: dict[str, str]
+
+    def __init__(self, *args: Any, read_errors: dict[str, str] | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.read_errors = read_errors or {}
+
+
 async def fetch_states(
     ha: HAClient,
     entity_ids: list[str],
-) -> dict[str, dict[str, Any]]:
+) -> States:
     """Fetch states for a list of entity_ids in parallel. Returns a dict keyed
     by entity_id.
 
-    An entity HA doesn't know (404) or whose single read failed is left out of
-    the dict; the flag evaluators treat a missing entity as dark, so it is
-    reported, not dropped.
+    An entity HA doesn't know (404) is left out of the dict; the flag
+    evaluators treat a missing entity as dark, so it is reported, not dropped.
+    A read that fails while others succeed is retried once, since one timeout
+    among a few dozen parallel reads is usually a hiccup; if it fails again it
+    is left out too and listed in `read_errors`, so the flag can say the read
+    failed rather than that the entity is gone.
 
     Raises HAError when no read succeeded at all: HA is down, hung, or rejected
     the token. Swallowing that case left every caller with an empty snapshot,
@@ -51,13 +65,20 @@ async def fetch_states(
         return eid, raw, None
 
     results = await asyncio.gather(*(one(eid) for eid in entity_ids))
-    errors = [err for _, _, err in results if err is not None]
-    if entity_ids and len(errors) == len(entity_ids):
+    failed = [eid for eid, _, err in results if err is not None]
+    if entity_ids and len(failed) == len(entity_ids):
+        first = next(err for _, _, err in results if err is not None)
         raise HAError(
             f"Could not read any of the {len(entity_ids)} entities from HA, so there "
-            f"is no health to report. First error: {errors[0]}"
+            f"is no health to report. First error: {first}"
         )
-    return {eid: raw for eid, raw, _ in results if raw is not None}
+    if failed:
+        retried = await asyncio.gather(*(one(eid) for eid in failed))
+        results = [r for r in results if r[2] is None] + list(retried)
+    return States(
+        {eid: raw for eid, raw, _ in results if raw is not None},
+        read_errors={eid: str(err) for eid, _, err in results if err is not None},
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
