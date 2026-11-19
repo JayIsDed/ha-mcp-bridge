@@ -39,6 +39,10 @@ Entry schema (see `EntitySpec` below for the typed version):
                              staleness is expected (a delta-reporting lux sensor idles at
                              its dark floor) and is flagged info/known instead of warn.
                              A stale read ABOVE the threshold is a real stall → warn.
+    offline_level: str       level of the entity_offline flag raised when this entity is
+                             unavailable, unknown or has no state for longer than the
+                             flag's threshold. Default "warn". "critical" marks life
+                             support: the probes and heater the tank's heat depends on.
 """
 
 from __future__ import annotations
@@ -68,6 +72,7 @@ class EntitySpec:
     gated_by: str | None = None
     powered_by: str | None = None
     stale_dark_lux: float | None = None
+    offline_level: str | None = None
     notes: str | None = None
 
 
@@ -87,6 +92,7 @@ SHELF_ENTITIES: dict[str, dict[str, Any]] = {
         "target": 77.0,
         "band": 0.5,
         "flag_band": 1.0,
+        "offline_level": "critical",
         "notes": "Primary L1 control input, cross-cal reference for L2 Inkbird.",
     },
     "tank_substrate": {
@@ -98,6 +104,7 @@ SHELF_ENTITIES: dict[str, dict[str, Any]] = {
         "active": True,
         "target": 77.0,
         "flag_band": 1.5,
+        "offline_level": "critical",
         "notes": "Near-substrate probe; pairs with tank_center for stratification check.",
     },
     "shelf_ambient": {
@@ -245,6 +252,7 @@ SHELF_ENTITIES: dict[str, dict[str, Any]] = {
         "unit": None,
         "active": True,
         "target": 77.0,
+        "offline_level": "critical",
         "powered_by": "switch.cal_shelf_inkbird_10g",
     },
     "climate_bucket_rig": {
@@ -267,6 +275,7 @@ SHELF_ENTITIES: dict[str, dict[str, Any]] = {
         "unit": "W",
         "active": True,
         "range": (0.0, 150.0),  # normal firing window; >150 flags overdraw
+        "offline_level": "critical",
     },
     "heater_switch": {
         "entity_id": "switch.cal_shelf_inkbird_10g",
@@ -275,6 +284,7 @@ SHELF_ENTITIES: dict[str, dict[str, Any]] = {
         "role": "switch",
         "unit": None,
         "active": True,
+        "offline_level": "critical",
     },
     "heater_voltage": {
         "entity_id": "sensor.cal_shelf_inkbird_10g_voltage",

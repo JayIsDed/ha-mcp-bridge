@@ -386,7 +386,7 @@ def flag_sensor_stale(
 
         raw = states.get(entry["entity_id"])
         if raw is None or _is_unavailable(raw):
-            continue  # offline handled elsewhere; this flag is specifically about staleness-while-available
+            continue  # flag_entity_offline / flag_canopy_offline report these; this one is staleness-while-available
 
         lc = _last_changed(raw)
         secs = _seconds_since(lc, now)
@@ -428,6 +428,154 @@ def flag_sensor_stale(
     return flags
 
 
+# Unavailable/unknown this long before it counts as dark. Measured blips: the
+# ESPHome boards drop to unavailable for ~0.1 s on a reconnect and the smart
+# plugs showed none in a week, while a real outage runs for days. An HA restart
+# clears in a minute or two. 10 min is far above the noise and still well inside
+# the hours a cooling tank gives you.
+OFFLINE_AFTER_S = 600
+
+
+def _fmt_age(secs: float) -> str:
+    if secs < 7200:
+        return f"{secs / 60:.0f} min"
+    if secs < 172800:
+        return f"{secs / 3600:.0f} h"
+    return f"{secs / 86400:.1f} days"
+
+
+def flag_entity_offline(
+    states: dict[str, dict[str, Any]],
+    registry: dict[str, dict[str, Any]],
+    now: datetime,
+) -> list[dict[str, Any]]:
+    """Any active entity that is unavailable, unknown or null for longer than
+    OFFLINE_AFTER_S, or that HA returned no state for at all.
+
+    Level comes from the entry's `offline_level` (default warn); the probes and
+    heater the tank's heat depends on are critical. The canopy board is left to
+    flag_canopy_offline, and entries whose known_state says offline are skipped,
+    as sensor_stale does.
+
+    `since` is when the entity went dark (its last_changed), so the age is real.
+    """
+    flags: list[dict[str, Any]] = []
+    for key, entry in registry.items():
+        if not entry.get("active"):
+            continue
+        if entry.get("container") == "canopy":
+            continue
+        if entry.get("known_state") and "offline" in str(entry["known_state"]).lower():
+            continue
+
+        eid = entry["entity_id"]
+        raw = states.get(eid)
+        if raw is not None and not _is_unavailable(raw):
+            continue
+
+        level = entry.get("offline_level") or "warn"
+        if raw is None:
+            since = None
+            detail = "has no state in HA (entity missing, or its read failed)"
+        else:
+            since = _last_changed(raw)
+            secs = _seconds_since(since, now)
+            if secs is not None and secs < OFFLINE_AFTER_S:
+                continue
+            shown = raw.get("state") or "null"
+            detail = f"has been {shown}" + (f" for {_fmt_age(secs)}" if secs is not None else "")
+        message = f"{key} ({eid}) {detail}."
+        if level == "critical":
+            message += " Life support: nothing is watching or driving this part of the tank."
+        flags.append({
+            "flag": f"entity_offline:{key}",
+            "level": level,
+            "since": since.isoformat() if since else None,
+            "message": message,
+            "known": False,
+        })
+    return flags
+
+
+def flag_tank_heater_not_heating(
+    states: dict[str, dict[str, Any]],
+    registry: dict[str, dict[str, Any]],
+    now: datetime,
+) -> dict[str, Any] | None:
+    """The main tank wants heat and the heater has no power.
+
+    "Wants heat": climate_main_tank is in heat mode and either reports
+    hvac_action=heating, or tank_center sits below target by more than its
+    flag_band. The second arm matters because a thermostat whose heater switch
+    has gone unavailable reports idle, not heating, while the tank cools.
+    `flag_band` (not the hysteresis `band`) keeps clear of the moment between
+    the tank crossing the on-threshold and the thermostat flipping the switch.
+
+    "No power": the heater switch is not on (off, unavailable, missing), or it
+    is on and heater_power reads 1 W or less. The plug must have sat that way
+    for 5 min (the later of the switch's and the power reading's last change),
+    so a heater that has just been switched on is not flagged.
+
+    Critical when the plug is off or drawing nothing; warn when the plug is on
+    but its power reading is dark, since then the heat can't be confirmed
+    either way.
+    """
+    climate = _get_state(states, registry, "climate_main_tank")
+    if not climate or climate.get("state") != "heat":
+        return None
+
+    power_raw = _get_state(states, registry, "heater_power")
+    power = _state_value(power_raw)
+    if power is not None and power > 1.0:
+        return None
+
+    tank = _state_value(_get_state(states, registry, "tank_center"))
+    tank_entry = registry.get("tank_center", {})
+    target = _climate_target(climate)
+    if target is None:
+        target = tank_entry.get("target")
+    flag_band = tank_entry.get("flag_band")
+
+    calling = _hvac_action(climate) == "heating"
+    cold = (
+        tank is not None
+        and target is not None
+        and flag_band is not None
+        and tank < target - flag_band
+    )
+    if not (calling or cold):
+        return None
+
+    switch_raw = _get_state(states, registry, "heater_switch")
+    plug = _state_raw(switch_raw) if switch_raw else None
+    changes = [t for t in (_last_changed(switch_raw), _last_changed(power_raw)) if t]
+    since = max(changes) if changes else None
+    secs = _seconds_since(since, now)
+    if secs is not None and secs < 300:
+        return None
+
+    why = (
+        "calling for heat" if calling
+        else f"tank {tank:.1f}°F is {target - tank:.1f}°F below target {target:.1f}°F"
+    )
+    if plug == "on" and power is None:
+        level = "warn"
+        cause = "the heater plug is on but its power reading is dark, so the heat can't be confirmed"
+    elif plug == "on":
+        level = "critical"
+        cause = f"the heater plug is on and drawing {power:.1f} W"
+    else:
+        level = "critical"
+        cause = f"the heater plug is {plug or 'missing'}"
+    return {
+        "flag": "tank_heater_not_heating",
+        "level": level,
+        "since": since.isoformat() if since else None,
+        "message": f"Main tank thermostat is {why}, but {cause}.",
+        "known": False,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Flag registry — orchestrator runs all of these and collects non-None outputs
 # ─────────────────────────────────────────────────────────────────────────────
@@ -440,12 +588,14 @@ SINGLE_FLAGS: tuple[Callable, ...] = (
     flag_stratification,
     flag_heater_overdraw,
     flag_basement_cold_drift,
+    flag_tank_heater_not_heating,
 )
 
 # Functions returning a list of dicts (0..N)
 MULTI_FLAGS: tuple[Callable, ...] = (
     flag_tds_out_of_range,
     flag_sensor_stale,
+    flag_entity_offline,
 )
 
 
