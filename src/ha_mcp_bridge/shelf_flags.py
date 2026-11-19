@@ -497,6 +497,21 @@ def flag_entity_offline(
     return flags
 
 
+# How long a heater without power must stay that way before it counts as
+# failed. Measured over 528 normal relay-on cycles (2.5 months of recorded
+# history): the heater draws within 7 s of the plug switching on, and its own
+# built-in thermostat then cycles it off for up to 5.7 min at a time (p99
+# 5.5 min) while the plug stays on and the tank sits in band. So:
+# - the heater never drew since the plug switched on, the plug is off or dark,
+#   or the tank is already cold: 5 min, far above the 7 s switch-on lag;
+# - it drew and then stopped while the tank is in band, which is what a normal
+#   cycle's tail looks like: 15 min, 2.6x the longest normal tail. A heater
+#   that dies mid-cycle is still caught at 15 min, or within 5 min of the tank
+#   falling below the flag band, whichever comes first.
+HEATER_HOLD_S = 300
+HEATER_TAIL_HOLD_S = 900
+
+
 def flag_tank_heater_not_heating(
     states: dict[str, dict[str, Any]],
     registry: dict[str, dict[str, Any]],
@@ -513,8 +528,10 @@ def flag_tank_heater_not_heating(
 
     "No power": the heater switch is not on (off, unavailable, missing), or it
     is on and heater_power reads 1 W or less. The plug must have sat that way
-    for 5 min (the later of the switch's and the power reading's last change),
-    so a heater that has just been switched on is not flagged.
+    (the later of the switch's and the power reading's last change) for
+    HEATER_HOLD_S, or HEATER_TAIL_HOLD_S when the heater drew since the plug
+    switched on and the tank is in band: a heater's own thermostat cuts out for
+    a few minutes at the end of every normal cycle.
 
     Critical when the plug is off or drawing nothing; warn when the plug is on
     but its power reading is dark, since then the heat can't be confirmed
@@ -548,10 +565,22 @@ def flag_tank_heater_not_heating(
 
     switch_raw = _get_state(states, registry, "heater_switch")
     plug = _state_raw(switch_raw) if switch_raw else None
-    changes = [t for t in (_last_changed(switch_raw), _last_changed(power_raw)) if t]
+    switch_changed, power_changed = _last_changed(switch_raw), _last_changed(power_raw)
+    changes = [t for t in (switch_changed, power_changed) if t]
     since = max(changes) if changes else None
+    # The power reading changed after the plug switched on and now reads ~0:
+    # the heater drew, then stopped. With the tank in band that is the shape of
+    # a normal cycle's tail, so it gets the longer hold.
+    drew_then_stopped = (
+        plug == "on"
+        and power is not None
+        and switch_changed is not None
+        and power_changed is not None
+        and power_changed > switch_changed
+    )
+    hold = HEATER_TAIL_HOLD_S if drew_then_stopped and not cold else HEATER_HOLD_S
     secs = _seconds_since(since, now)
-    if secs is not None and secs < 300:
+    if secs is not None and secs < hold:
         return None
 
     lead = (
@@ -564,6 +593,8 @@ def flag_tank_heater_not_heating(
     elif plug == "on":
         level = "critical"
         cause = f"the heater plug is on and drawing {power:.1f} W"
+        if secs is not None:
+            cause += f" for {fmt_age(secs)}"
     else:
         level = "critical"
         cause = f"the heater plug is {plug or 'missing'}"

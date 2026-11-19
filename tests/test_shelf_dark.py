@@ -224,3 +224,56 @@ def test_real_registry_dark_heater_plug_flags() -> None:
     flags = flags_by_name(states, SHELF_ENTITIES)
     assert flags["entity_offline:heater_switch"]["level"] == "critical"
     assert flags["entity_offline:heater_power"]["level"] == "critical"
+
+
+# ─── heater: a normal cycle's tail is not a dead heater ──────────────────────
+#
+# The heater's own thermostat cuts out for up to ~5.7 min at the end of a
+# normal cycle while the plug stays on and the thermostat still calls. The
+# 5 min hold flagged that as a dead heater several times a day.
+
+
+def tail(on_ago: timedelta, zero_ago: timedelta, tank: str = "77.3") -> dict[str, dict]:
+    """Plug switched on `on_ago`, heater drew, then dropped to 0 W `zero_ago`."""
+    states = healthy()
+    states["switch.heater_a"] = st("switch.heater_a", "on", on_ago)
+    states["sensor.heater_a_power"] = st("sensor.heater_a_power", "0.0", zero_ago)
+    states["sensor.tank_a_temp"] = st("sensor.tank_a_temp", tank)
+    states["sensor.tank_a_temp_low"] = st("sensor.tank_a_temp_low", tank)
+    states["climate.tank_a"] = thermostat("heating", current=float(tank))
+    return states
+
+
+def test_normal_cycle_tail_is_not_flagged() -> None:
+    """The longest tail seen in the measured history: 5.7 min at 0 W."""
+    states = tail(timedelta(minutes=16), timedelta(minutes=5, seconds=40))
+    assert "tank_heater_not_heating" not in flags_by_name(states)
+
+
+def test_long_tail_inside_the_tail_hold_is_not_flagged() -> None:
+    states = tail(timedelta(minutes=40), timedelta(minutes=14))
+    assert "tank_heater_not_heating" not in flags_by_name(states)
+
+
+def test_heater_that_dies_mid_cycle_is_caught_after_the_tail_hold() -> None:
+    """Control: drew, then 0 W for 16 min with the thermostat calling."""
+    states = tail(timedelta(minutes=40), timedelta(minutes=16))
+    flag = flags_by_name(states)["tank_heater_not_heating"]
+    assert flag["level"] == "critical"
+    assert flag["since"] == (NOW - timedelta(minutes=16)).isoformat()
+
+
+def test_heater_that_never_draws_is_caught_at_five_minutes() -> None:
+    """Control: the plug switched on 6 min ago and the meter never moved off 0 W."""
+    states = healthy()
+    states["switch.heater_a"] = st("switch.heater_a", "on", timedelta(minutes=6))
+    states["sensor.heater_a_power"] = st("sensor.heater_a_power", "0.0", timedelta(hours=2))
+    flag = flags_by_name(states)["tank_heater_not_heating"]
+    assert flag["level"] == "critical"
+    assert flag["since"] == (NOW - timedelta(minutes=6)).isoformat()
+
+
+def test_heater_that_stops_with_the_tank_cold_is_caught_at_five_minutes() -> None:
+    """Control: a tail-shaped 0 W, but the tank is below the flag band."""
+    states = tail(timedelta(minutes=40), timedelta(minutes=6), tank="75.5")
+    assert flags_by_name(states)["tank_heater_not_heating"]["level"] == "critical"
