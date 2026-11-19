@@ -554,9 +554,9 @@ def flag_tank_heater_not_heating(
     if secs is not None and secs < 300:
         return None
 
-    why = (
-        "calling for heat" if calling
-        else f"tank {tank:.1f}°F is {target - tank:.1f}°F below target {target:.1f}°F"
+    lead = (
+        "Main tank thermostat is calling for heat" if calling
+        else f"Main tank is {tank:.1f}°F, {target - tank:.1f}°F below target {target:.1f}°F"
     )
     if plug == "on" and power is None:
         level = "warn"
@@ -571,7 +571,7 @@ def flag_tank_heater_not_heating(
         "flag": "tank_heater_not_heating",
         "level": level,
         "since": since.isoformat() if since else None,
-        "message": f"Main tank thermostat is {why}, but {cause}.",
+        "message": f"{lead}, but {cause}.",
         "known": False,
     }
 
