@@ -42,7 +42,11 @@ Entry schema (see `EntitySpec` below for the typed version):
     offline_level: str       level of the entity_offline flag raised when this entity is
                              unavailable, unknown or has no state for longer than the
                              flag's threshold. Default "warn". "critical" marks life
-                             support: the probes and heater the tank's heat depends on.
+                             support: the probes, heater and pump the tank depends on.
+    offline_after_s: int     how long this entity may be dark before entity_offline
+                             flags it, in place of the flag's default (10 min). The
+                             pump uses 5 min: its outlet never dropped in 64 days of
+                             recent history, and its earlier drops were real outages.
 """
 
 from __future__ import annotations
@@ -73,6 +77,7 @@ class EntitySpec:
     powered_by: str | None = None
     stale_dark_lux: float | None = None
     offline_level: str | None = None
+    offline_after_s: int | None = None
     notes: str | None = None
 
 
@@ -304,6 +309,8 @@ SHELF_ENTITIES: dict[str, dict[str, Any]] = {
         "role": "outlet_power",
         "unit": "W",
         "active": True,
+        "offline_level": "critical",
+        "offline_after_s": 300,
         "notes": "Main tank pump — household convention: always outlet 1.",
     },
     "outlet_1_pump_switch": {
@@ -313,6 +320,8 @@ SHELF_ENTITIES: dict[str, dict[str, Any]] = {
         "role": "switch",
         "unit": None,
         "active": True,
+        "offline_level": "critical",
+        "offline_after_s": 300,
     },
     "outlet_2_bucket_power": {
         "entity_id": "sensor.calibration_shelf_strip_tapo_p316m_2_current_consumption",

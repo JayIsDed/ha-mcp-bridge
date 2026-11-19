@@ -452,8 +452,9 @@ def flag_entity_offline(
     """Any active entity that is unavailable, unknown or null for longer than
     OFFLINE_AFTER_S, or that HA returned no state for at all.
 
-    Level comes from the entry's `offline_level` (default warn); the probes and
-    heater the tank's heat depends on are critical. The canopy board is left to
+    Level comes from the entry's `offline_level` (default warn); the probes,
+    heater and pump the tank depends on are critical. An entry's
+    `offline_after_s` replaces OFFLINE_AFTER_S for it. The canopy board is left to
     flag_canopy_offline, and entries whose known_state says offline are skipped,
     as sensor_stale does.
 
@@ -480,7 +481,7 @@ def flag_entity_offline(
         else:
             since = _last_changed(raw)
             secs = _seconds_since(since, now)
-            if secs is not None and secs < OFFLINE_AFTER_S:
+            if secs is not None and secs < entry.get("offline_after_s", OFFLINE_AFTER_S):
                 continue
             shown = raw.get("state") or "null"
             detail = f"has been {shown}" + (f" for {fmt_age(secs)}" if secs is not None else "")
@@ -607,6 +608,60 @@ def flag_tank_heater_not_heating(
     }
 
 
+# A running pump never drew less than 2.3 W in four months of recorded history
+# (every hour's minimum, mid-July to mid-November), so 1 W or less means it has
+# stopped. The hold matches the heater's: long enough that a pump switched on a
+# moment ago and a meter catching up don't flag.
+PUMP_STOPPED_W = 1.0
+PUMP_HOLD_S = 300
+
+
+def flag_pump_not_running(
+    states: dict[str, dict[str, Any]],
+    registry: dict[str, dict[str, Any]],
+    now: datetime,
+) -> dict[str, Any] | None:
+    """The tank pump's outlet is switched off, or on and drawing ~0 W, for
+    PUMP_HOLD_S. Critical: the pump is life support.
+
+    A dark outlet (unavailable, unknown or missing) is left to
+    flag_entity_offline, which reports it at the pump entries' own
+    offline_level and offline_after_s, so one fault raises one flag.
+    """
+    entry = registry.get("outlet_1_pump_switch")
+    if not entry or not entry.get("active"):
+        return None
+    switch_raw = _get_state(states, registry, "outlet_1_pump_switch")
+    power_raw = _get_state(states, registry, "outlet_1_pump_power")
+    plug = _state_raw(switch_raw)
+    power = _state_value(power_raw)
+
+    if plug == "off":
+        since = _last_changed(switch_raw)
+        cause = "is switched off"
+    elif plug == "on" and power is not None and power <= PUMP_STOPPED_W:
+        changes = [t for t in (_last_changed(switch_raw), _last_changed(power_raw)) if t]
+        since = max(changes) if changes else None
+        cause = f"is on but drawing {power:.1f} W"
+    else:
+        return None  # running, or dark: flag_entity_offline reports dark
+
+    secs = _seconds_since(since, now)
+    if secs is not None and secs < PUMP_HOLD_S:
+        return None
+    age = f" for {fmt_age(secs)}" if secs is not None else ""
+    return {
+        "flag": "pump_not_running",
+        "level": "critical",
+        "since": since.isoformat() if since else None,
+        "message": (
+            f"The tank pump's outlet ({entry['entity_id']}) {cause}{age}. "
+            "Life support: nothing is moving water through the tank."
+        ),
+        "known": False,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Flag registry — orchestrator runs all of these and collects non-None outputs
 # ─────────────────────────────────────────────────────────────────────────────
@@ -620,6 +675,7 @@ SINGLE_FLAGS: tuple[Callable, ...] = (
     flag_heater_overdraw,
     flag_basement_cold_drift,
     flag_tank_heater_not_heating,
+    flag_pump_not_running,
 )
 
 # Functions returning a list of dicts (0..N)

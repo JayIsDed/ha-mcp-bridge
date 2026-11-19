@@ -53,6 +53,16 @@ REG = {
         "entity_id": "sensor.heater_a_voltage", "category": "power", "container": "tank_a",
         "role": "voltage", "unit": "V", "active": True, "range": (115.0, 125.0),
     },
+    "outlet_1_pump_switch": {
+        "entity_id": "switch.pump_a", "category": "power", "container": "tank_a",
+        "role": "switch", "unit": None, "active": True, "offline_level": "critical",
+        "offline_after_s": 300,
+    },
+    "outlet_1_pump_power": {
+        "entity_id": "sensor.pump_a_power", "category": "power", "container": "tank_a",
+        "role": "outlet_power", "unit": "W", "active": True, "offline_level": "critical",
+        "offline_after_s": 300,
+    },
 }
 
 
@@ -68,7 +78,7 @@ def thermostat(action: str, mode: str = "heat", current: float = 77.0) -> dict:
 
 
 def healthy() -> dict[str, dict]:
-    """Heater calling and drawing, probes in band, TDS in range."""
+    """Heater calling and drawing, pump running, probes in band, TDS in range."""
     return {
         "sensor.tank_a_temp": st("sensor.tank_a_temp", "76.8"),
         "sensor.tank_a_temp_low": st("sensor.tank_a_temp_low", "76.7"),
@@ -77,6 +87,8 @@ def healthy() -> dict[str, dict]:
         "sensor.heater_a_power": st("sensor.heater_a_power", "100.0", timedelta(minutes=20)),
         "switch.heater_a": st("switch.heater_a", "on", timedelta(minutes=20)),
         "sensor.heater_a_voltage": st("sensor.heater_a_voltage", "121.0"),
+        "switch.pump_a": st("switch.pump_a", "on", timedelta(days=30)),
+        "sensor.pump_a_power": st("sensor.pump_a_power", "2.5", timedelta(seconds=10)),
     }
 
 
@@ -277,3 +289,69 @@ def test_heater_that_stops_with_the_tank_cold_is_caught_at_five_minutes() -> Non
     """Control: a tail-shaped 0 W, but the tank is below the flag band."""
     states = tail(timedelta(minutes=40), timedelta(minutes=6), tank="75.5")
     assert flags_by_name(states)["tank_heater_not_heating"]["level"] == "critical"
+
+
+# ─── pump: off, drawing nothing, or dark is critical ─────────────────────────
+
+
+def test_pump_switched_off_is_critical() -> None:
+    states = healthy()
+    states["switch.pump_a"] = st("switch.pump_a", "off", timedelta(minutes=6))
+    flag = flags_by_name(states)["pump_not_running"]
+    assert flag["level"] == "critical"
+    assert "switched off" in flag["message"]
+    assert flag["since"] == (NOW - timedelta(minutes=6)).isoformat()
+
+
+def test_pump_drawing_nothing_is_critical() -> None:
+    """Outlet on, pump unplugged, seized or dead: the meter reads 0 W."""
+    states = healthy()
+    states["sensor.pump_a_power"] = st("sensor.pump_a_power", "0.0", timedelta(minutes=10))
+    flag = flags_by_name(states)["pump_not_running"]
+    assert flag["level"] == "critical"
+    assert "0.0 W" in flag["message"]
+
+
+def test_pump_dark_is_critical_after_five_minutes() -> None:
+    states = healthy()
+    for eid in ("switch.pump_a", "sensor.pump_a_power"):
+        states[eid] = st(eid, "unavailable", timedelta(minutes=6))
+    flags = flags_by_name(states)
+    assert flags["entity_offline:outlet_1_pump_switch"]["level"] == "critical"
+    assert "pump_not_running" not in flags  # one fault, reported by entity_offline
+
+
+def test_pump_switched_on_a_moment_ago_is_not_flagged() -> None:
+    """Control: 0 W from a pump switched on 30 s ago is the meter catching up."""
+    states = healthy()
+    states["switch.pump_a"] = st("switch.pump_a", "on", timedelta(seconds=30))
+    states["sensor.pump_a_power"] = st("sensor.pump_a_power", "0.0", timedelta(hours=1))
+    assert "pump_not_running" not in flags_by_name(states)
+
+
+def test_pump_blip_under_five_minutes_is_not_flagged() -> None:
+    """Control: a 2 min drop, about what an HA restart takes."""
+    states = healthy()
+    for eid in ("switch.pump_a", "sensor.pump_a_power"):
+        states[eid] = st(eid, "unavailable", timedelta(minutes=2))
+    assert not any("pump" in name for name in flags_by_name(states))
+
+
+def test_registry_marks_the_pump_critical() -> None:
+    for key in ("outlet_1_pump_switch", "outlet_1_pump_power"):
+        assert SHELF_ENTITIES[key].get("offline_level") == "critical", key
+        assert SHELF_ENTITIES[key].get("offline_after_s") == 300, key
+
+
+def test_real_registry_pump_off_and_dark() -> None:
+    states = healthy_shelf_states(NOW)
+    eid = SHELF_ENTITIES["outlet_1_pump_switch"]["entity_id"]
+    states[eid] = st(eid, "off", timedelta(minutes=6))
+    assert flags_by_name(states, SHELF_ENTITIES)["pump_not_running"]["level"] == "critical"
+
+    states = healthy_shelf_states(NOW)
+    for key in ("outlet_1_pump_switch", "outlet_1_pump_power"):
+        eid = SHELF_ENTITIES[key]["entity_id"]
+        states[eid] = st(eid, "unavailable", timedelta(minutes=6))
+    flags = flags_by_name(states, SHELF_ENTITIES)
+    assert flags["entity_offline:outlet_1_pump_switch"]["level"] == "critical"
