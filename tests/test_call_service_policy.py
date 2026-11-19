@@ -29,9 +29,13 @@ def server_mod(monkeypatch):
 
 @pytest.fixture
 def server_disabled(monkeypatch):
-    """Re-import with allowlists unset — tool should default-deny."""
-    monkeypatch.delenv("HA_MCP_ALLOWED_SERVICES", raising=False)
-    monkeypatch.delenv("HA_MCP_ALLOWED_ENTITY_PATTERNS", raising=False)
+    """Re-import with allowlists empty — tool should default-deny.
+
+    Set to "" rather than deleted: the reload re-reads a project .env, and python-dotenv
+    only leaves a variable alone when it is already present in the environment.
+    """
+    monkeypatch.setenv("HA_MCP_ALLOWED_SERVICES", "")
+    monkeypatch.setenv("HA_MCP_ALLOWED_ENTITY_PATTERNS", "")
     monkeypatch.setenv("HA_TOKEN", "fake-for-import")
     import ha_mcp_bridge.server as mod
 
