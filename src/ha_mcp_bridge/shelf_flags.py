@@ -436,7 +436,7 @@ def flag_sensor_stale(
 OFFLINE_AFTER_S = 600
 
 
-def _fmt_age(secs: float) -> str:
+def fmt_age(secs: float) -> str:
     if secs < 7200:
         return f"{secs / 60:.0f} min"
     if secs < 172800:
@@ -483,7 +483,7 @@ def flag_entity_offline(
             if secs is not None and secs < OFFLINE_AFTER_S:
                 continue
             shown = raw.get("state") or "null"
-            detail = f"has been {shown}" + (f" for {_fmt_age(secs)}" if secs is not None else "")
+            detail = f"has been {shown}" + (f" for {fmt_age(secs)}" if secs is not None else "")
         message = f"{key} ({eid}) {detail}."
         if level == "critical":
             message += " Life support: nothing is watching or driving this part of the tank."

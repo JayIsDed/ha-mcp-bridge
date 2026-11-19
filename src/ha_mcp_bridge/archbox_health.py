@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .ha_client import HAClient
+from .shelf_flags import fmt_age
 from .shelf_health import fetch_states
 
 # --- registry -------------------------------------------------------------
@@ -76,20 +77,65 @@ def _numeric(state: str | None) -> float | None:
         return None
 
 
+# Values read from the smart plug, which reports whether or not the box is on.
+# The rest come from telegraf on the box and go quiet when it sleeps.
+PLUG_KEYS = frozenset({"wall_power", "line_voltage", "today_kwh", "month_kwh"})
+
+# Freshness. HA re-polls the influxdb sensors every 60 s (measured: 57-60 s
+# minimum gap between recorded changes) and the plug every ~5 s, and stamps
+# last_reported on every poll even when the value is unchanged. A value HA has
+# not heard for 5 min (five missed polls, and the window archbox_health_full
+# reads from InfluxDB) is stale: it is held out of vitals, listed under
+# `stale` with its timestamp, and flagged.
+STALE_AFTER_S = 300
+
+
 def _round(value: float | None, digits: int = 1) -> float | None:
     return None if value is None else round(value, digits)
 
 
+def _as_of(raw: dict[str, Any]) -> datetime | None:
+    """When HA last heard this entity: last_reported, else last_updated."""
+    ts = raw.get("last_reported") or raw.get("last_updated") or raw.get("last_changed")
+    if not ts:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _iso(ts: datetime | None) -> str | None:
+    return ts.isoformat(timespec="seconds") if ts else None
+
+
 def compose_archbox(states: dict[str, dict[str, Any]], now: datetime) -> dict[str, Any]:
-    """Pure function: raw HA states -> pulse payload. Unit-testable without HA."""
+    """Pure function: raw HA states -> pulse payload. Unit-testable without HA.
+
+    Every value carries its timestamp in `as_of`. A value older than
+    STALE_AFTER_S (or with no timestamp at all) is never shown as current: it
+    reads null in vitals and moves to `stale` as {value, as_of}.
+    """
     vitals: dict[str, Any] = {}
+    as_of: dict[str, str | None] = {}
+    stale: dict[str, dict[str, Any]] = {}
+    stale_ts: dict[str, datetime | None] = {}
     for key, entity_id in ARCHBOX_ENTITIES.items():
         raw = states.get(entity_id) or {}
-        vitals[key] = _round(_numeric(raw.get("state")))
+        value = _round(_numeric(raw.get("state")))
+        ts = _as_of(raw)
+        as_of[key] = _iso(ts)
+        if value is not None and (ts is None or (now - ts).total_seconds() > STALE_AFTER_S):
+            stale[key] = {"value": value, "as_of": _iso(ts)}
+            stale_ts[key] = ts
+            value = None
+        vitals[key] = value
 
     for key, entity_id in ARCHBOX_SWITCHES.items():
         raw = states.get(entity_id) or {}
         vitals[key] = raw.get("state") or "unknown"
+        as_of[key] = _iso(_as_of(raw))
 
     # --- derived: the numbers you would otherwise compute by hand ---
     wall, gpu = vitals.get("wall_power"), vitals.get("gpu_power")
@@ -105,19 +151,38 @@ def compose_archbox(states: dict[str, dict[str, Any]], now: datetime) -> dict[st
 
     # --- flags ---
     flags: list[dict[str, Any]] = []
-    online = vitals.get("power_switch") == "on"
+    power_state = vitals.get("power_switch")
+    online = power_state == "on"
 
-    if not online:
+    if power_state not in ("on", "off"):
+        flags.append({
+            "flag": "power_switch_unknown", "level": "warn", "known": False,
+            "message": f"switch.archbox reads {power_state}, so whether the box is on "
+                       "can't be told; treating it as off.",
+        })
+    elif not online:
         flags.append({
             "flag": "archbox_offline", "level": "info", "known": True,
             "message": "archbox is powered off; telemetry will be stale. "
                        "Wake with switch.archbox (magic packet).",
         })
 
+    for key, ts in stale_ts.items():
+        if not online and key not in PLUG_KEYS:
+            continue  # a sleeping box goes quiet by design; archbox_offline says so
+        heard = (
+            f"last heard {fmt_age((now - ts).total_seconds())} ago ({_iso(ts)})"
+            if ts else "has no timestamp"
+        )
+        flags.append({
+            "flag": f"sensor_stale:{key}", "level": "warn", "known": False,
+            "message": f"{key} {heard}; held out of vitals.",
+        })
+
     for key, (warn, crit) in THRESHOLDS.items():
         val = vitals.get(key)
         if val is None:
-            if online:
+            if online and key not in stale:
                 flags.append({
                     "flag": f"sensor_unavailable:{key}", "level": "warn", "known": False,
                     "message": f"{key} has no value while the box is on — check telegraf "
@@ -156,6 +221,8 @@ def compose_archbox(states: dict[str, dict[str, Any]], now: datetime) -> dict[st
         "online": online,
         "summary": summary,
         "vitals": vitals,
+        "as_of": as_of,
+        "stale": stale,
         "flags": flags,
     }
 
